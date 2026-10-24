@@ -46,7 +46,7 @@ the Mesh or Kernel needs them to route, authorize, or validate work.
 | `description` | No | One-sentence purpose used by peers for routing decisions |
 | `capability_descriptions` | No | Mapping from capability name to a concrete routing description. Distributed planning uses it instead of guessing from a short tag. |
 | `capability_contracts` | No | Mapping from capability name to authorized `effects`, provider `systems`, and optional planner-visible `produces` artifact descriptions. |
-| `output_schema` | No | Pydantic model class enforced on CoderSubAgent execution output. Validate other role outputs or richer work products in an application subclass. |
+| `output_schema` | No | Pydantic model class for the agent's result. It shapes the `done` call, and `done` is refused, with the failing rules shown to the agent, until the result is a valid instance (validators included). |
 | `default_kernel_role` | No | Preferred fallback role for specialist agents. Built-ins are `"researcher"`, `"coder"`, `"communicator"`, and `"browser"`; products may register custom roles through an extended Kernel. Leave unset for generalists. |
 | `goal_oriented` | No | Defaults to `False`; set `True` for multi-step goal decomposition |
 | `requires_auth` | No | Defaults to `False`; set `True` to receive Nexus-backed `_auth_manager` |
@@ -260,7 +260,12 @@ Some steps already say which sub-agent they need, so the Kernel routes them with
 | Declares a role (`execution_contract.kernel_role` or `default_kernel_role`) | that role |
 | The Mesh's own response step (`effect: final_response`) | `communicator` |
 
-Everything else goes to the structured router.
+Everything else goes to the structured router. When the task needs no role at
+all (summarising, rewording, explaining or drafting from what the task gives,
+with no tool, lookup, calculation or action), the router answers it in the same
+call, following the agent's `system_prompt`, so the reply costs one model call.
+This applies only when the router runs on the model the communicator would use;
+set `KERNEL_ROUTER_MAY_ANSWER=false` to always route.
 
 ### Analysis, not code: the `single_response` contract
 
@@ -432,7 +437,7 @@ prior = raw.get("output", raw) if isinstance(raw, dict) else {}
 
 Checkpointing happens automatically. After every OODA loop turn, the Kernel calls `UnifiedMemory.save_checkpoint()` which writes the current `KernelState` (all accumulated findings, tool history, reasoning progress, and the recent conversation) to Redis under `checkpoint:{workflow_id}:{step_id}`. If the process crashes and the workflow restarts, the `WorkflowEngine` detects the existing checkpoint and resumes from that turn rather than restarting from scratch.
 
-The same checkpoint carries a step across execution epochs and approval pauses. A resumed step continues the conversation it was having, and a browser step whose epoch ran out continues on the same page (see [Browser Automation](./browser-automation.md#session-lifecycle)). Reaching the turn cap mid-work ends the epoch the same way as an exhausted token or time budget: the step continues in its next epoch while the workflow's `max_epochs_per_step` allows, and stops only after the last.
+The same checkpoint carries a step across execution epochs and approval pauses. A resumed step continues the conversation it was having, and a browser step whose epoch ran out continues on the same page (see [Browser Automation](../reference/browser.md#which-browser-is-used)). Reaching the turn cap mid-work ends the epoch the same way as an exhausted token or time budget: the step continues in its next epoch while the workflow's `max_epochs_per_step` allows, and stops only after the last.
 
 You do not call `save_checkpoint()` or `load_checkpoint()` in application code. The framework manages this transparently when `REDIS_URL` is configured. Without Redis, there is no persistence and no crash recovery: the workflow starts from the beginning on failure.
 

@@ -115,13 +115,13 @@ def _check_init_exists(bundle: str, result: _Result) -> bool:
     return True  # warn, not hard fail
 
 
-def _check_syntax(path: Path, result: _Result) -> Optional[ast.Module]:
-    """Parse the atom file as an AST. Returns the tree or None on failure."""
+def _check_syntax(path: Path, result: _Result) -> Optional[Tuple[str, ast.Module]]:
+    """Parse the atom file as an AST. Returns (source, tree) or None on failure."""
     try:
         code = path.read_text(encoding="utf-8")
         tree = ast.parse(code, filename=str(path))
         result.ok("File parses as valid Python")
-        return tree
+        return code, tree
     except SyntaxError as exc:
         result.fail(f"Syntax error: {exc}")
         return None
@@ -244,13 +244,14 @@ def _check_return_dict(fn: ast.FunctionDef, result: _Result):
         result.warn("Return statement returns None — atoms must return a dict")
 
 
-def _check_atom_contract(path: Path, bundle: str, atom: str, result: _Result) -> bool:
+def _check_atom_contract(path: Path, bundle: str, atom: str, result: _Result,
+                         source: Optional[str] = None, tree: Optional[ast.Module] = None) -> bool:
     """Use the runtime's atom contract so developer tooling cannot drift from it."""
     from jarviscore.execution.atom_contract import read_contract
 
-    contract = read_contract(
-        path.read_text(encoding="utf-8"), system=bundle, expected_name=atom
-    )
+    if source is None:
+        source, tree = path.read_text(encoding="utf-8"), None
+    contract = read_contract(source, system=bundle, expected_name=atom, tree=tree)
     problems = list(contract.problems)
     if contract.atom is not None and contract.atom.legacy:
         problems.append(
@@ -279,12 +280,13 @@ def run_dry_run(bundle: str, atom: str) -> bool:
 
     _check_init_exists(bundle, result)
 
-    tree = _check_syntax(path, result)
-    if not tree:
+    parsed = _check_syntax(path, result)
+    if not parsed:
         _print_summary(result)
         return False
+    source, tree = parsed
 
-    _check_atom_contract(path, bundle, atom, result)
+    _check_atom_contract(path, bundle, atom, result, source, tree)
     _check_forbidden_imports(tree, result)
     _print_summary(result)
     return result.success
@@ -311,6 +313,44 @@ def run_integration(bundle: str, atom: str, connection_id: str, nexus_url: str) 
     Run dry-run checks then verify Nexus connection resolves.
     Returns True if all checks pass.
     """
+    return run_integration_many(bundle, [atom], connection_id, nexus_url)[0]
+
+
+def run_integration_many(bundle: str, atoms: List[str], connection_id: str, nexus_url: str) -> List[bool]:
+    """Integration-check several atoms concurrently; output is printed in ``atoms`` order."""
+    import contextlib
+    import io
+
+    outputs: List[List[str]] = []
+    results: List[Optional[bool]] = []
+    for atom in atoms:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            results.append(_integration_preflight(bundle, atom, connection_id, nexus_url))
+        outputs.append([buf.getvalue()])
+
+    pending = [i for i, r in enumerate(results) if r is None]
+    if pending:
+        import asyncio
+
+        try:
+            live = asyncio.run(_resolve_all(bundle, connection_id, nexus_url, len(pending)))
+            for i, (ok, lines) in zip(pending, live):
+                results[i] = ok
+                outputs[i].extend(lines)
+        except Exception as exc:
+            for i in pending:
+                results[i] = False
+                outputs[i].append(f"  {_err(f'Integration check error: {exc}')}\n")
+
+    for chunk in outputs:
+        sys.stdout.write("".join(chunk))
+    sys.stdout.flush()
+    return [bool(r) for r in results]
+
+
+def _integration_preflight(bundle: str, atom: str, connection_id: str, nexus_url: str) -> Optional[bool]:
+    """Dry-run part of an integration check. None means: go on to the live Nexus check."""
     print(f"\n  {_bold(atom)}  [integration]")
     print(f"  {'─' * 48}")
 
@@ -320,11 +360,12 @@ def run_integration(bundle: str, atom: str, connection_id: str, nexus_url: str) 
     if not path:
         print(f"  {_err('Dry-run: file missing — fix before integration test')}")
         return False
-    tree = _check_syntax(path, dry_result)
-    if not tree:
+    parsed = _check_syntax(path, dry_result)
+    if not parsed:
         print(f"  {_err('Dry-run: syntax error — fix before integration test')}")
         return False
-    _check_atom_contract(path, bundle, atom, dry_result)
+    source, tree = parsed
+    _check_atom_contract(path, bundle, atom, dry_result, source, tree)
     _check_forbidden_imports(tree, dry_result)
 
     if not dry_result.success:
@@ -341,70 +382,91 @@ def run_integration(bundle: str, atom: str, connection_id: str, nexus_url: str) 
     print(f"  {_info(f'connection_id: {connection_id}')}")
 
     try:
-        import httpx
+        import httpx  # noqa: F401
     except ImportError:
         print(f"  {_warn('httpx not installed — skipping live Nexus check')}")
         print(f"  {_info('Install with: pip install httpx')}")
         return dry_result.success
+    return None
 
-    try:
-        import asyncio
 
-        async def _resolve():
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                # Health check first
+async def _resolve_all(bundle: str, connection_id: str, nexus_url: str, count: int):
+    import asyncio
+
+    import httpx
+
+    # Same lookup as `jarviscore nexus`: NEXUS_GATEWAY_API_KEY from the
+    # environment, else from ./.env.
+    from jarviscore.cli.nexus import _gateway_headers
+
+    async with httpx.AsyncClient(timeout=10.0, headers=_gateway_headers()) as client:
+        health = health_exc = None
+        try:
+            health = await client.get(f"{nexus_url}/health")
+        except Exception as exc:
+            health_exc = exc
+        sem = asyncio.Semaphore(8)
+
+        async def one() -> Tuple[bool, List[str]]:
+            out: List[str] = []
+            async with sem:
                 try:
-                    health = await client.get(f"{nexus_url}/health")
-                    if health.status_code == 200:
-                        print(f"  {_ok(f'Gateway reachable ({nexus_url}/health → {health.status_code})')}")
-                    else:
-                        print(f"  {_warn(f'Gateway returned {health.status_code} on /health — may still work')}")
+                    ok = await _resolve_one(client, health, health_exc, bundle,
+                                            connection_id, nexus_url, out)
                 except Exception as exc:
-                    print(f"  {_err(f'Gateway unreachable: {exc}')}")
-                    print(f"  {_info('Start the Nexus stack with: jarviscore nexus up')}")
-                    return None
+                    out.append(f"  {_err(f'Integration check error: {exc}')}\n")
+                    ok = False
+            return ok, out
 
-                # Attempt to resolve the connection
-                try:
-                    resp = await client.get(
-                        f"{nexus_url}/v1/connections/{connection_id}/token",
-                    )
-                    if resp.status_code == 200:
-                        payload = resp.json()
-                        print(f"  {_ok(f'connection_id resolved — token payload received')}")
-                        # Show non-sensitive fields
-                        safe_payload = {
-                            k: v for k, v in payload.items()
-                            if k not in ("access_token", "refresh_token", "client_secret", "api_key")
-                        }
-                        if safe_payload:
-                            print(f"  {_dim('Token fields (secrets redacted):')}")
-                            for k, v in safe_payload.items():
-                                print(f"    {_dim(k)}: {_dim(str(v)[:80])}")
-                        return payload
-                    elif resp.status_code == 404:
-                        print(f"  {_err(f'connection_id not found: {connection_id}')}")
-                        print(f"  {_info(f'Register with: jarviscore nexus register {bundle}')}")
-                        return None
-                    else:
-                        print(f"  {_warn(f'Unexpected response: {resp.status_code} — {resp.text[:200]}')}")
-                        return None
-                except Exception as exc:
-                    print(f"  {_err(f'Token resolution failed: {exc}')}")
-                    return None
+        return await asyncio.gather(*(one() for _ in range(count)))
 
-        payload = asyncio.run(_resolve())
 
-        if payload:
-            print(f"\n  {_ok('Integration check passed')}")
-            print(f"  {_info('Next step: mark atom as verified in seed_registry.py if it behaves correctly against the live API')}")
-            return True
-        else:
-            return False
+async def _resolve_one(client, health, health_exc, bundle: str, connection_id: str,
+                       nexus_url: str, out: List[str]) -> bool:
+    def emit(line: str) -> None:
+        out.append(line + "\n")
 
-    except Exception as exc:
-        print(f"  {_err(f'Integration check error: {exc}')}")
+    if health_exc is not None:
+        emit(f"  {_err(f'Gateway unreachable: {health_exc}')}")
+        emit(f"  {_info('Start the Nexus stack with: jarviscore nexus up')}")
         return False
+    if health.status_code == 200:
+        emit(f"  {_ok(f'Gateway reachable ({nexus_url}/health → {health.status_code})')}")
+    else:
+        emit(f"  {_warn(f'Gateway returned {health.status_code} on /health — may still work')}")
+
+    payload = None
+    try:
+        resp = await client.get(
+            f"{nexus_url}/v1/token/{connection_id}",
+        )
+        if resp.status_code == 200:
+            payload = resp.json()
+            emit(f"  {_ok(f'connection_id resolved — token payload received')}")
+            # Show non-sensitive fields
+            # Credentials sit under "credentials"; every field there is secret.
+            safe_payload = {
+                k: v for k, v in payload.items()
+                if k not in ("credentials", "access_token", "refresh_token", "client_secret", "api_key")
+            }
+            if safe_payload:
+                emit(f"  {_dim('Token fields (secrets redacted):')}")
+                for k, v in safe_payload.items():
+                    emit(f"    {_dim(k)}: {_dim(str(v)[:80])}")
+        elif resp.status_code == 404:
+            emit(f"  {_err(f'connection_id not found: {connection_id}')}")
+            emit(f"  {_info(f'Register with: jarviscore nexus register {bundle}')}")
+        else:
+            emit(f"  {_warn(f'Unexpected response: {resp.status_code} — {resp.text[:200]}')}")
+    except Exception as exc:
+        emit(f"  {_err(f'Token resolution failed: {exc}')}")
+        payload = None
+
+    if payload:
+        emit(f"\n  {_ok('Integration check passed')}")
+        emit(f"  {_info('Next step: mark atom as verified in seed_registry.py if it behaves correctly against the live API')}")
+        return True
+    return False
 
 
 # ── Bundle/atom discovery ─────────────────────────────────────────────────────
@@ -430,8 +492,20 @@ def _get_all_bundles() -> List[str]:
 
 # ── Sub-command: test ─────────────────────────────────────────────────────────
 
+DEFAULT_NEXUS_URL = "http://localhost:8090"
+
+
+def _resolve_nexus_url(explicit: "str | None") -> str:
+    """The Gateway for `atom test`: --nexus-url, else NEXUS_GATEWAY_URL from the
+    environment or ./.env (the same lookup that supplies the API key), else the
+    local default. Resolving URL and key from the same place keeps a key read
+    from ./.env from being sent to localhost."""
+    from jarviscore.cli.nexus import _gateway_url
+    return explicit or _gateway_url() or DEFAULT_NEXUS_URL
+
+
 def cmd_test(args):
-    nexus_url = args.nexus_url or os.getenv("NEXUS_GATEWAY_URL", "http://localhost:8090")
+    nexus_url = _resolve_nexus_url(args.nexus_url)
 
     print(f"\n{_bold('JarvisCore Atom Test Harness')}")
     print(f"{_dim('Mode: ' + args.mode)}")
@@ -482,16 +556,16 @@ def cmd_test(args):
     print(_info(f"Bundle: {bundle}  |  Atoms: {len(atoms)}"))
     all_passed = True
 
-    for atom in atoms:
-        if args.mode == "dry-run":
+    if args.mode == "dry-run":
+        for atom in atoms:
             if not run_dry_run(bundle, atom):
                 all_passed = False
-        else:
-            if not args.connection_id:
-                print(_err("--connection-id is required for --mode integration"))
-                sys.exit(1)
-            if not run_integration(bundle, atom, args.connection_id, nexus_url):
-                all_passed = False
+    else:
+        if not args.connection_id:
+            print(_err("--connection-id is required for --mode integration"))
+            sys.exit(1)
+        if not all(run_integration_many(bundle, atoms, args.connection_id, nexus_url)):
+            all_passed = False
 
     print(f"\n{'═' * 52}")
     if all_passed:
@@ -571,9 +645,9 @@ Examples:
                         help="Nexus connection_id (required for --mode integration)")
     test_p.add_argument("--mode",          choices=["dry-run", "integration"], default="dry-run",
                         help="Test mode (default: dry-run)")
-    test_p.add_argument("--nexus-url",     dest="nexus_url",
-                        default=os.getenv("NEXUS_GATEWAY_URL", "http://localhost:8090"),
-                        help="Nexus Gateway URL (default: NEXUS_GATEWAY_URL env var or http://localhost:8090)")
+    test_p.add_argument("--nexus-url",     dest="nexus_url", default=None,
+                        help="Nexus Gateway URL (default: NEXUS_GATEWAY_URL from the environment or ./.env, "
+                             "else http://localhost:8090)")
     test_p.add_argument("--all",           action="store_true",
                         help="Test every atom across all bundles (dry-run only)")
 

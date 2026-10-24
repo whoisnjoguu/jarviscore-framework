@@ -49,6 +49,9 @@ from jarviscore.orchestration.envelopes import (
     terminal_step_status,
 )
 from jarviscore.orchestration.budget import workflow_budget_scope
+from jarviscore.orchestration.step_context import in_step
+from jarviscore.auth.spending import spending_scope
+from jarviscore.auth.principal import act_for
 from jarviscore.kernel.state import ToolReceiptError, hydrate_receipt_evidence
 
 logger = logging.getLogger(__name__)
@@ -394,6 +397,7 @@ class Mesh:
             "egress_proxy_url",
             "egress_proxy_bypass",
             "telemetry_trace_dir",
+            "hitl_targets",
         ):
             if knob in self._settings.model_fields_set:
                 self.config.setdefault(knob, getattr(self._settings, knob))
@@ -451,6 +455,7 @@ class Mesh:
                 if knob in self._settings.model_fields_set:
                     self.config.setdefault(knob, getattr(self._settings, knob))
 
+        peers_injected = False
         if self.config.get("p2p_enabled", False):
             self._logger.info("Initializing P2P coordinator (SWIM)...")
             try:
@@ -461,6 +466,13 @@ class Mesh:
                 await self._p2p_coordinator.start()
                 self._capabilities.add("peer_swim")
                 self._logger.info("✓ P2P coordinator started")
+
+                # The coordinator answers capability requests from here on, and
+                # announcing can take a minute when known peers are unreachable.
+                # Register PeerClients now, or a peer that already learned of an
+                # agent has its request dropped for want of a client to deliver to.
+                self._inject_peer_clients()
+                peers_injected = True
 
                 # Wait for SWIM to stabilise: if seed_nodes are configured,
                 # poll until at least one peer is known (up to 5s); otherwise
@@ -494,7 +506,10 @@ class Mesh:
                 self._logger.warning("P2P coordinator init failed (continuing without): %s", exc)
 
         # ── 5. PeerClients — always injected, transport depends on capabilities
-        self._inject_peer_clients()
+        # With P2P they already were, as the coordinator started; replacing them
+        # would orphan any request already in flight.
+        if not peers_injected:
+            self._inject_peer_clients()
         self._capabilities.add("peer_local")
         self._logger.info(
             "✓ PeerClients injected (transports: %s)",
@@ -556,6 +571,7 @@ class Mesh:
                     name=f"distributed-worker-{agent.agent_id}",
                 )
                 for agent in self.agents
+                if getattr(agent, "mesh_worker", True)
             ]
             self._scheduler_task = asyncio.create_task(
                 self._run_scheduler(), name=f"mesh-scheduler-{self._node_id}"
@@ -694,6 +710,9 @@ class Mesh:
                         "revision": 0,
                         "result_summary": "",
                         "steps": [],
+                        "output": None,
+                        "evidence": [],
+                        "waiting": None,
                     }
                 raise RuntimeError(f"Workflow {identity!r} was not published before timeout")
             return await self._wait_for_workflow_terminal(identity, definition, timeout)
@@ -1054,7 +1073,10 @@ class Mesh:
             ],
             "storage_scope": (
                 "shared"
-                if getattr(self._settings, "storage_backend", "local") != "local"
+                if (
+                    getattr(self, "_storage_backend", None)
+                    or getattr(self._settings, "storage_backend", "local")
+                ) != "local"
                 else "node"
             ),
             "materializer_node_id": self._node_id,
@@ -1225,7 +1247,9 @@ class Mesh:
                             ),
                             planning_brief=self.config.get("mesh_planning_brief"),
                         )
-                        with workflow_budget_scope(
+                        # Planning is model use for the person the goal is for, too.
+                        with act_for(self._acting_for(source)), spending_scope(self._redis_store), \
+                                workflow_budget_scope(
                             self._redis_store,
                             workflow_id,
                             epoch_id=f"planning:{self._node_id}",
@@ -1270,6 +1294,8 @@ class Mesh:
     def _mesh_capability_catalog(self) -> Dict[str, Any]:
         catalog: Dict[str, Any] = {}
         for agent in self.agents:
+            if not getattr(agent, "mesh_worker", True):
+                continue
             role_description = str(
                 getattr(agent, "description", "") or agent.role
             )
@@ -1599,7 +1625,7 @@ class Mesh:
                 if overall != "waiting":
                     self._redis_store.unregister_active_workflow(workflow_id)
                 self._workflow_activity.pop(workflow_id, None)
-                return {
+                return self._goal_result({
                     "workflow_id": workflow_id,
                     "status": overall,
                     "obligation_status": obligation_status,
@@ -1611,10 +1637,63 @@ class Mesh:
                         terminal_summaries[0] if len(terminal_summaries) == 1 else ""
                     ),
                     "steps": steps,
-                }
+                }, current_step_ids, dependency_ids)
             await self._idle_for(interval, mark)
         self._workflow_activity.pop(workflow_id, None)
         raise TimeoutError(f"Workflow {workflow_id!r} did not finish within {timeout}s")
+
+    @staticmethod
+    def _goal_result(result: Dict[str, Any], current: set, dependencies: set) -> Dict[str, Any]:
+        """Add what a caller reads from a goal, as run_task and workflow return it.
+
+        ``output`` is what the goal delivered: the completed final step of the
+        current plan (its response step, or its only terminal step).
+        ``evidence`` collects every current step's tool observations.
+        ``waiting`` names the step paused for a person, with why.
+        """
+        from jarviscore.core.envelope import caller_view
+
+        steps = [step for step in result["steps"] if str(step.get("id")) in current]
+        evidence: List[Dict[str, Any]] = []
+        seen: set = set()
+        for step in steps:
+            for item in caller_view(step.get("output") or {}).get("evidence") or []:
+                marker = item.get("tool_receipt_id") or id(item)
+                if marker not in seen:
+                    seen.add(marker)
+                    evidence.append({**item, "step_id": step.get("id")})
+        delivered = [
+            step for step in steps
+            if step.get("status") == "completed" and str(step.get("id")) not in dependencies
+            and isinstance(step.get("output"), dict)
+        ]
+        final = next((step for step in delivered if step.get("effect") == "final_response"), None)
+        if final is None and len(delivered) == 1:
+            final = delivered[0]
+        envelope = caller_view(final["output"]) if final else {}
+        output = envelope.get("output", envelope.get("payload")) if isinstance(envelope, dict) else None
+        if final and not result.get("result_summary") and isinstance(envelope, dict):
+            result["result_summary"] = str(envelope.get("result_summary") or "")
+        waiting = next((step for step in steps if step.get("status") == "waiting"), None)
+        if result.get("status") == "failed" and not result.get("error"):
+            # Why it failed, in the failing step's own words, not only in steps.
+            stopped = next((step for step in steps if step.get("status") == "failed"), None) \
+                or next((step for step in steps if step.get("status") == "blocked"), None)
+            saved = (stopped or {}).get("output") or {}
+            reason = saved.get("error") or saved.get("result_summary") or (stopped or {}).get("error")
+            if reason:
+                result["error"] = str(reason)
+        result.update({
+            "output": output,
+            "evidence": evidence,
+            "waiting": {
+                "step_id": waiting.get("id"),
+                "reason": str((waiting.get("output") or {}).get("result_summary")
+                              or (waiting.get("output") or {}).get("error") or ""),
+                "metadata": (waiting.get("output") or {}).get("yield_metadata") or {},
+            } if waiting else None,
+        })
+        return result
 
     def cancel_goal(self, workflow_id: str, *, reason: str = "Goal cancelled") -> bool:
         """Durably cancel shared work so no peer can claim or commit it later."""
@@ -1664,12 +1743,15 @@ class Mesh:
         step_id = self._redis_store.get_hitl_action_step(workflow_id, action_id)
         if step_id is None:
             raise KeyError(f"Workflow {workflow_id!r} has no action {action_id!r} awaiting a decision")
-        if self._redis_store.get_hitl_resolution(workflow_id, step_id, action_id) is not None:
-            raise ValueError("This action has already been decided.")
-        self._redis_store.resolve_hitl_request(
-            workflow_id, step_id, normalized.value,
-            responder=resolved_by, comment=note, action_id=action_id,
+        # The first decision stands: an approval and a refusal sent together cannot both land.
+        decided = self._redis_store.resolve_hitl_action_once(
+            workflow_id, step_id, action_id, normalized.value,
+            responder=resolved_by, comment=note,
         )
+        if decided is None:
+            raise KeyError(f"Workflow {workflow_id!r} has no action {action_id!r} awaiting a decision")
+        if decided is False:
+            raise ValueError("This action has already been decided.")
         return await self.resume_goal(workflow_id, step_id, timeout=timeout)
 
     async def replan_goal(
@@ -2121,7 +2203,8 @@ class Mesh:
                         break
                     claim_id = f"{member.agent_id}:{uuid4().hex}"
                     if not self._redis_store.claim_step(
-                        workflow_id, step_id, claim_id, lease_seconds=lease_seconds
+                        workflow_id, step_id, claim_id, lease_seconds=lease_seconds,
+                        role=member.role,
                     ):
                         state.release(member)
                         continue
@@ -2268,7 +2351,8 @@ class Mesh:
         )
         try:
             try:
-                with workflow_budget_scope(
+                with act_for(self._acting_for(workflow)), spending_scope(self._redis_store), \
+                        workflow_budget_scope(
                     self._redis_store,
                     workflow_id,
                     epoch_id=f"capability:{claim_id}",
@@ -2328,7 +2412,7 @@ class Mesh:
         claim_id = claim_id or f"{agent.agent_id}:{uuid4().hex}"
         if self._redis_store.get_step_status(workflow_id, step_id) == "pending":
             if not self._redis_store.claim_step(
-                workflow_id, step_id, claim_id, lease_seconds=lease_seconds
+                workflow_id, step_id, claim_id, lease_seconds=lease_seconds, role=agent.role,
             ):
                 return
         workflow = self._redis_store.get_workflow_definition(workflow_id) or {}
@@ -2392,7 +2476,8 @@ class Mesh:
         lease_lost = asyncio.Event()
 
         async def owned_work():
-            with workflow_budget_scope(
+            with act_for(self._acting_for(workflow)), spending_scope(self._redis_store), \
+                    in_step(workflow_id, step_id), workflow_budget_scope(
                 self._redis_store,
                 workflow_id,
                 epoch_id=f"step:{claim_id}",
@@ -2471,21 +2556,15 @@ class Mesh:
                                 and isinstance(bound_result, dict)
                                 and bound_status in {"success", "epoch_exhausted"}
                             ):
+                                from jarviscore.execution.workspace import DELTA_IGNORED_NAMES
+
                                 delta = await binding.export_delta(
                                     f"workflows/{workflow_id}/workspace_deltas/{step_id}",
                                     ignored_names=tuple(
                                         self.config.get(
                                             "workspace_delta_ignored_names"
                                         )
-                                        or (
-                                            ".git",
-                                            ".tmp",
-                                            ".venv",
-                                            "__pycache__",
-                                            "node_modules",
-                                            "output",
-                                            "target",
-                                        )
+                                        or DELTA_IGNORED_NAMES
                                     ),
                                 )
                                 if delta.added or delta.modified or delta.deleted:
@@ -2503,6 +2582,12 @@ class Mesh:
                                         continue
                                     entry = delta_entries.get(str(evidence.get("path") or ""))
                                     if entry is None:
+                                        logger.warning(
+                                            "Step %s wrote %s, but it is not among the files the "
+                                            "step changed (an ignored folder, deleted again, or "
+                                            "left as it was); its record is dropped",
+                                            step_id, evidence.get("path"),
+                                        )
                                         continue
                                     if (
                                         str(evidence.get("sha256") or "")
@@ -2723,6 +2808,17 @@ class Mesh:
         }
         return [step_id for step_id in direct if step_id not in shadowed]
 
+    @staticmethod
+    def _acting_for(workflow: Dict[str, Any]) -> Optional[str]:
+        """The person a workflow's steps act for, as registered with its goal.
+
+        Read only from the workflow definition, which trusted application code
+        registered: never from peer or capability-need context, which agents
+        write and could use to borrow someone else's accounts.
+        """
+        value = (workflow.get("context") or {}).get("acting_for")
+        return str(value) if value else None
+
     def _node_can_access_workspace(self, workflow_id: str) -> bool:
         workflow = self._redis_store.get_workflow_definition(workflow_id) or {}
         snapshot = (workflow.get("context") or {}).get("source_snapshot")
@@ -2814,9 +2910,18 @@ class Mesh:
                 )
                 if manifest_path:
                     await binding.apply_delta(await store.load_delta(manifest_path))
+            # Running a command is the authority of the node that runs it: its own
+            # workspace_allowed_commands, when set, rather than what the asking
+            # node allowed. Without its own, the asking node's still applies.
+            node_commands = self.config.get("workspace_allowed_commands")
+            allowed_commands = (
+                {str(command) for command in node_commands if str(command)}
+                if node_commands is not None
+                else set(snapshot_data.get("allowed_commands") or ())
+            )
             bound_sandbox = sandbox.for_workspace(
                 binding.workspace,
-                allowed_commands=set(snapshot_data.get("allowed_commands") or ()),
+                allowed_commands=allowed_commands,
                 bash_timeout=int(
                     self.config.get("workspace_command_timeout_seconds", 120)
                 ),
@@ -2911,9 +3016,21 @@ class Mesh:
     def _init_blob_storage(self, settings):
         """Init BlobStorage from settings. Always succeeds (local backend is default)."""
         try:
+            from types import SimpleNamespace
             from jarviscore.storage import get_blob_storage
-            storage = get_blob_storage(settings)
-            backend = getattr(settings, "storage_backend", "local")
+
+            backend = self.config.get("storage_backend") or getattr(
+                settings, "storage_backend", "local")
+            self._storage_backend = backend
+            redis_url = (
+                self.config.get("redis_store_url")
+                or self.config.get("redis_url")
+                or getattr(settings, "redis_url", None)
+            )
+            # The Mesh's own Redis, so STORAGE_BACKEND=redis follows a config-given URL.
+            storage = get_blob_storage(SimpleNamespace(
+                **{**vars(settings), "storage_backend": backend, "redis_url": redis_url}
+            ) if hasattr(settings, "__dict__") else settings)
             self._logger.info(f"✓ BlobStorage initialized ({backend})")
             return storage
         except Exception as exc:
@@ -3041,6 +3158,10 @@ class Mesh:
 
         # Resolve hitl_inbox path from config or use package-relative default
         inbox_dir = self.config.get("hitl_inbox_dir", None)
+        # Who responds to escalations: whichever people this deployment names.
+        hitl_targets = self.config.get("hitl_targets") or None
+        if isinstance(hitl_targets, str):
+            hitl_targets = [t.strip() for t in hitl_targets.split(",") if t.strip()]
 
         # Import framework-native HITLQueue
         try:
@@ -3067,6 +3188,7 @@ class Mesh:
                     agent_id=agent.agent_id,
                     inbox_dir=inbox_dir,
                     redis_store=self._redis_store,
+                    targets=hitl_targets,
                 )
             else:
                 agent.hitl = None  # degraded — log once

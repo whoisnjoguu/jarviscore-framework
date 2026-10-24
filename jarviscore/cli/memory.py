@@ -48,34 +48,28 @@ def _err(msg: str) -> None:
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
-async def cmd_status(_args: argparse.Namespace) -> None:
-    """Show health status of all memory tiers."""
-    _banner("JarvisCore Memory — Status", "═")
-
-    # 1. Athena
-    athena_url = os.getenv("ATHENA_URL", "").strip()
-    if athena_url:
-        from jarviscore.memory import get_athena_client
-        client = get_athena_client()
-        if client:
-            health = await client.health_check()
-            status = health.get("status", "unknown")
-            if status in ("ok", "healthy", "pass", "UP"):
-                _ok(f"Athena MemOS  {athena_url}  [{status}]")
-                deps = health.get("dependencies", {})
-                for dep, dep_status in deps.items():
-                    if dep_status in ("ok", "healthy", "pass", "UP", "true"):
-                        _ok(f"  └─ {dep}: {dep_status}")
-                    else:
-                        _warn(f"  └─ {dep}: {dep_status}")
-            else:
-                _err(f"Athena MemOS  {athena_url}  [{status}]")
+async def _athena_status(athena_url: str) -> list:
+    from jarviscore.memory import get_athena_client
+    lines: list = []
+    client = get_athena_client()
+    if client:
+        health = await client.health_check(timeout=2.5)
+        status = health.get("status", "unknown")
+        if status in ("ok", "healthy", "pass", "UP"):
+            lines.append((_ok, f"Athena MemOS  {athena_url}  [{status}]"))
+            deps = health.get("dependencies", {})
+            for dep, dep_status in deps.items():
+                if dep_status in ("ok", "healthy", "pass", "UP", "true"):
+                    lines.append((_ok, f"  └─ {dep}: {dep_status}"))
+                else:
+                    lines.append((_warn, f"  └─ {dep}: {dep_status}"))
+        else:
+            lines.append((_err, f"Athena MemOS  {athena_url}  [{status}]"))
         await client.close()
-    else:
-        _warn("Athena MemOS  NOT CONFIGURED — set ATHENA_URL to enable")
-        print("         e.g. export ATHENA_URL=http://localhost:8080")
+    return lines
 
-    # 2. Redis
+
+def _redis_status() -> list:
     try:
         import redis as _redis
         r = _redis.Redis(
@@ -83,13 +77,36 @@ async def cmd_status(_args: argparse.Namespace) -> None:
             port=int(os.getenv("REDIS_PORT", "6379")),
             db=int(os.getenv("REDIS_DB", "0")),
             decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
         )
         r.ping()
-        _ok(f"Redis  {os.getenv('REDIS_HOST','localhost')}:{os.getenv('REDIS_PORT','6379')}  [connected]")
+        return [(_ok, f"Redis  {os.getenv('REDIS_HOST','localhost')}:{os.getenv('REDIS_PORT','6379')}  [connected]")]
     except ImportError:
-        _warn("Redis  not installed — pip install 'jarviscore-framework[redis]'")
+        return [(_warn, "Redis  not installed — pip install 'jarviscore-framework[redis]'")]
     except Exception as exc:
-        _err(f"Redis  {exc}")
+        return [(_err, f"Redis  {exc}")]
+
+
+async def cmd_status(_args: argparse.Namespace) -> None:
+    """Show health status of all memory tiers."""
+    _banner("JarvisCore Memory — Status", "═")
+
+    athena_url = os.getenv("ATHENA_URL", "").strip()
+
+    async def _no_athena() -> list:
+        return [
+            (_warn, "Athena MemOS  NOT CONFIGURED — set ATHENA_URL to enable"),
+            (print, "         e.g. export ATHENA_URL=http://localhost:8080"),
+        ]
+
+    # 1. Athena and 2. Redis are checked concurrently, printed in order.
+    athena_lines, redis_lines = await asyncio.gather(
+        _athena_status(athena_url) if athena_url else _no_athena(),
+        asyncio.to_thread(_redis_status),
+    )
+    for emit, msg in (*athena_lines, *redis_lines):
+        emit(msg)
 
     # 3. Blob storage
     storage_backend = os.getenv("STORAGE_BACKEND", "local")
@@ -258,6 +275,41 @@ def _find_athena_repo() -> Optional[Path]:
     return None
 
 
+def _post_json(url: str, key: str, body: dict) -> tuple[int, str]:
+    """POST to an Azure deployment; returns (status, body text). Uses httpx, which
+    verifies TLS with certifi's CA bundle (urllib depends on the interpreter's, which
+    python.org builds on macOS do not install)."""
+    import httpx
+
+    try:
+        resp = httpx.post(url, json=body, headers={"api-key": key}, timeout=30)
+        return resp.status_code, resp.text
+    except Exception as exc:
+        return 0, str(exc)
+
+
+def _check_azure_deployments(key: str, chat: str, embedding: str) -> None:
+    """Warn now, not after memory silently stops forming, when a deployment is missing.
+
+    Reasoning deployments (gpt-5 and later, o-series) reject ``max_tokens``; that is
+    detected here and passed to Athena (``ATHENA_LLM_REASONING``) so it sends the
+    parameters they accept from its first request."""
+    ask = {"messages": [{"role": "user", "content": "ok"}]}
+    status, body = _post_json(os.environ["ATHENA_LLM_BASE_URL"], key, {**ask, "max_tokens": 1})
+    if status == 400 and "max_completion_tokens" in body:
+        status, body = _post_json(os.environ["ATHENA_LLM_BASE_URL"], key, {**ask, "max_completion_tokens": 64})
+        if status == 200:
+            os.environ.setdefault("ATHENA_LLM_REASONING", "true")
+            print(f"  ✅  '{chat}' is a reasoning deployment; Athena will send it the parameters it accepts")
+    if status != 200:
+        _warn(f"Azure chat deployment '{chat}' did not answer ({status}: {body[:160]}). Set "
+              "ATHENA_AZURE_CHAT_DEPLOYMENT to a deployed chat model (default gpt-4o-mini).")
+    status, body = _post_json(os.environ["ATHENA_EMBEDDING_BASE_URL"], key, {"input": "ok"})
+    if status != 200:
+        _warn(f"Azure embedding deployment '{embedding}' did not answer ({status}: {body[:160]}). Set "
+              "ATHENA_AZURE_EMBEDDING_DEPLOYMENT to a deployed embedding model (default text-embedding-3-small).")
+
+
 def _pick_llm_key() -> tuple[str, str, str]:
     """
     Find an LLM API key from the current environment.
@@ -267,20 +319,29 @@ def _pick_llm_key() -> tuple[str, str, str]:
     # Azure needs the endpoint too; the compose passes AZURE_OPENAI_* through
     azure_key = os.environ.get("AZURE_OPENAI_API_KEY", "").strip() or os.environ.get("AZURE_API_KEY", "").strip()
     azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip() or os.environ.get("AZURE_ENDPOINT", "").strip()
+    # Athena's providers are Gemini, Azure OpenAI and OpenAI (it has no Anthropic provider).
     checks = [
         ("gemini", "GEMINI_API_KEY", "gemini-2.0-flash"),
         ("gemini", "GOOGLE_API_KEY", "gemini-2.0-flash"),
         ("openai", "OPENAI_API_KEY", "gpt-4o-mini"),
-        ("anthropic", "ANTHROPIC_API_KEY", "claude-3-haiku-20240307"),
     ]
     for provider, env_var, model in checks[:2]:
         key = os.environ.get(env_var, "").strip()
         if key:
             return provider, key, model
     if azure_key and azure_endpoint:
-        model = os.environ.get("AZURE_DEPLOYMENT", "").strip() or "gpt-4o"
+        # Athena summarises with max_tokens and temperature, which reasoning
+        # deployments (gpt-5 and later) refuse: it needs a chat deployment of its own.
+        model = os.environ.get("ATHENA_AZURE_CHAT_DEPLOYMENT", "").strip() or "gpt-4o-mini"
+        embedding = os.environ.get("ATHENA_AZURE_EMBEDDING_DEPLOYMENT", "").strip() or "text-embedding-3-small"
+        base = azure_endpoint.rstrip("/")
         os.environ.setdefault("AZURE_OPENAI_API_KEY", azure_key)
-        os.environ.setdefault("AZURE_OPENAI_ENDPOINT", azure_endpoint)
+        os.environ.setdefault("AZURE_OPENAI_ENDPOINT", base)
+        os.environ.setdefault("ATHENA_LLM_BASE_URL",
+                              f"{base}/openai/deployments/{model}/chat/completions?api-version=2024-08-01-preview")
+        os.environ.setdefault("ATHENA_EMBEDDING_BASE_URL",
+                              f"{base}/openai/deployments/{embedding}/embeddings?api-version=2023-05-15")
+        _check_azure_deployments(azure_key, model, embedding)
         return "azure", azure_key, model
     if azure_key and not azure_endpoint:
         _warn("AZURE_OPENAI_API_KEY is set but AZURE_OPENAI_ENDPOINT is not; skipping Azure")
@@ -291,6 +352,25 @@ def _pick_llm_key() -> tuple[str, str, str]:
     return "gemini", "", "gemini-2.0-flash"
 
 
+def _dotenv_value(path: Path, name: str) -> str:
+    """Return NAME's value from a .env file, or "" if the file or line is absent."""
+    if not path.exists():
+        return ""
+    for line in path.read_text().splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == name:
+            return value.strip().strip('"').strip("'")
+    return ""
+
+
+def _append_dotenv(path: Path, name: str, value: str) -> None:
+    """Add NAME=value as its own line, even when the file's last line has no newline."""
+    text = path.read_text() if path.exists() else ""
+    if text and not text.endswith("\n"):
+        text += "\n"
+    path.write_text(f"{text}{name}={value}\n")
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     """
     One-command Athena setup — same philosophy as 'jarviscore nexus init'.
@@ -299,7 +379,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     2. Pull + start all 7 services via docker compose
        (--from-source builds Athena from a local clone instead)
     3. Wait for Athena to be healthy (up to 90s — Milvus is slow)
-    4. Write ATHENA_URL to the project .env
+    4. Write ATHENA_URL and ATHENA_API_KEY to the project .env
     """
     import shutil
     import subprocess
@@ -329,18 +409,28 @@ def cmd_init(args: argparse.Namespace) -> None:
             sys.exit(1)
         print(f"  ✅  Athena source: {athena_dir}")
     else:
-        print("  ✅  Athena image: ghcr.io/prescott-data/athena:latest")
+        print(f"  ✅  Athena image: {os.environ.get('ATHENA_IMAGE') or 'ghcr.io/prescott-data/athena:v0.2.0'}")
 
     # LLM key
     provider, llm_key, model = _pick_llm_key()
     if not llm_key:
-        _err("No LLM API key found. Set one of: GEMINI_API_KEY, AZURE_OPENAI_API_KEY (+ AZURE_OPENAI_ENDPOINT), OPENAI_API_KEY, ANTHROPIC_API_KEY")
+        _err("No LLM API key found. Set one of: GEMINI_API_KEY, AZURE_OPENAI_API_KEY (+ AZURE_OPENAI_ENDPOINT), OPENAI_API_KEY")
         sys.exit(1)
     print(f"  ✅  LLM: {provider} / {model}")
+
+    # Athena requires authentication. JarvisCore holds a service key: it serves
+    # many tenants and names the tenant in each request.
+    env_file = Path.cwd() / ".env"
+    api_key = os.environ.get("ATHENA_API_KEY", "").strip() or _dotenv_value(env_file, "ATHENA_API_KEY")
+    generated_key = not api_key
+    if generated_key:
+        import secrets
+        api_key = secrets.token_hex(32)
 
     # Prepare env for compose
     env = {
         **os.environ,
+        "ATHENA_API_KEY":       api_key,
         "ATHENA_LLM_API_KEY":   llm_key,
         "ATHENA_LLM_PROVIDER":  provider,
         "ATHENA_LLM_MODEL":     model,
@@ -376,30 +466,38 @@ def cmd_init(args: argparse.Namespace) -> None:
     print("  Waiting for Athena to be ready (Milvus takes ~60s on first boot)...")
     athena_port = os.environ.get("ATHENA_PORT", "8080").strip() or "8080"
     athena_url = f"http://localhost:{athena_port}"
-    for attempt in range(90):
+    start = time.monotonic()
+    deadline = start + 90
+    next_report = 10
+    while True:
         try:
-            resp = urllib.request.urlopen(f"{athena_url}/api/v1/health", timeout=2)
+            remaining = deadline - time.monotonic()
+            req = urllib.request.Request(f"{athena_url}/api/v1/health", headers={"X-API-Key": api_key})
+            resp = urllib.request.urlopen(req, timeout=max(0.1, min(2, remaining)))
             data = json.loads(resp.read())
             if data.get("status") in ("ok", "healthy", "pass", "UP"):
                 break
         except Exception:
             pass
-        time.sleep(1)
-        if attempt % 10 == 9:
-            print(f"    ...still waiting ({attempt + 1}s)")
-    else:
-        _warn("Athena didn't become healthy in 90s — check: docker logs athena")
-        sys.exit(1)
+        if time.monotonic() >= deadline:
+            _warn("Athena didn't become healthy in 90s — check: docker logs athena")
+            sys.exit(1)
+        time.sleep(max(0, min(1, deadline - time.monotonic())))
+        if time.monotonic() - start >= next_report:
+            print(f"    ...still waiting ({next_report}s)")
+            next_report += 10
 
-    # 5. Write ATHENA_URL to .env
-    env_file = Path.cwd() / ".env"
-    env_text = env_file.read_text() if env_file.exists() else ""
-    if "ATHENA_URL" not in env_text:
-        env_text += f"\nATHENA_URL={athena_url}\n"
-        env_file.write_text(env_text)
-        print(f"  ✅  Wrote ATHENA_URL={athena_url} to {env_file}")
-    else:
+    # 5. Write ATHENA_URL and ATHENA_API_KEY to .env
+    if _dotenv_value(env_file, "ATHENA_URL"):
         print("  ✅  ATHENA_URL already set")
+    else:
+        _append_dotenv(env_file, "ATHENA_URL", athena_url)
+        print(f"  ✅  Wrote ATHENA_URL={athena_url} to {env_file}")
+    if _dotenv_value(env_file, "ATHENA_API_KEY") or not generated_key:
+        print("  ✅  ATHENA_API_KEY already set")
+    else:
+        _append_dotenv(env_file, "ATHENA_API_KEY", api_key)
+        print(f"  ✅  Wrote a new ATHENA_API_KEY to {env_file} (keep it secret)")
 
     print()
     _banner("Athena is live!", "─")

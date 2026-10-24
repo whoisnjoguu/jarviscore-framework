@@ -3,16 +3,17 @@ Unified LLM Client - All providers in one file with zero-config setup
 Supports: JarvisCore promotion, vLLM, Azure OpenAI, Gemini, Vertex AI, Claude
 """
 import asyncio
-import aiohttp
 import functools
-import httpx
+import importlib
+import importlib.util
 import inspect
 import json
 import logging
 import random
 import re
 import time
-from typing import Optional, Dict, List, Any, Tuple
+import weakref
+from typing import TYPE_CHECKING, Optional, Dict, List, Any, Tuple
 from enum import Enum
 
 from jarviscore.context.context_manager import ContextManager
@@ -20,7 +21,12 @@ from jarviscore.execution import multimodal, native_tools
 from jarviscore.execution.governor import current_lane, process_governor, retry_after_seconds
 from jarviscore.config.paths import runtime_path
 from jarviscore.promo import PROMO_MODEL
+from jarviscore.auth.spending import PersonCharge
 from jarviscore.orchestration.budget import current_workflow_budget
+
+if TYPE_CHECKING:
+    import aiohttp
+    import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -122,34 +128,75 @@ def _get_llm_semaphore(max_concurrent: int) -> Optional[asyncio.Semaphore]:
     return _LLM_SEMAPHORE
 
 
-# Try importing optional LLM SDKs
-try:
-    from google import genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
+# Optional LLM SDKs: availability is probed without importing them; the SDK
+# itself loads on first provider setup. Tests may patch these names directly.
+def _sdk_installed(module: str) -> bool:
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+GEMINI_AVAILABLE = _sdk_installed("google.genai")
+if not GEMINI_AVAILABLE:
     logger.debug("Gemini SDK not available (pip install google-genai)")
 
-try:
-    from openai import AsyncAzureOpenAI, DefaultAsyncHttpxClient
-    AZURE_AVAILABLE = True
-except ImportError:
-    AZURE_AVAILABLE = False
+AZURE_AVAILABLE = _sdk_installed("openai")
+if not AZURE_AVAILABLE:
     logger.debug("Azure OpenAI SDK not available (pip install openai)")
 
-try:
-    from anthropic import Anthropic
-    CLAUDE_AVAILABLE = True
-except ImportError:
-    CLAUDE_AVAILABLE = False
+CLAUDE_AVAILABLE = _sdk_installed("anthropic")
+if not CLAUDE_AVAILABLE:
     logger.debug("Claude SDK not available (pip install anthropic)")
+
+genai = None
+AsyncAzureOpenAI = None
+DefaultAsyncHttpxClient = None
+Anthropic = None
+AnthropicHttpxClient = None
+
+_SDK_LOADERS = {
+    "genai": ("google.genai", None),
+    "AsyncAzureOpenAI": ("openai", "AsyncAzureOpenAI"),
+    "DefaultAsyncHttpxClient": ("openai", "DefaultAsyncHttpxClient"),
+    "Anthropic": ("anthropic", "Anthropic"),
+    "AnthropicHttpxClient": ("anthropic", "DefaultHttpxClient"),
+}
+
+
+def _sdk(name: str) -> Any:
+    """Return the SDK object bound to ``name``, importing it on first use."""
+    value = globals()[name]
+    if value is None:
+        module_name, attr = _SDK_LOADERS[name]
+        module = importlib.import_module(module_name)
+        value = globals()[name] = getattr(module, attr) if attr else module
+    return value
+
+
+def __getattr__(name: str):
+    # Keeps `jarviscore.execution.llm.aiohttp` / `.httpx` resolvable (tests patch through them).
+    if name in ("aiohttp", "httpx"):
+        return importlib.import_module(name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _connection_limits(config: Dict[str, Any]) -> "httpx.Limits":
+    """The provider SDKs' pool limits, with idle connections kept for the next call."""
+    import httpx
+
+    return httpx.Limits(
+        max_connections=1000,
+        max_keepalive_connections=100,
+        keepalive_expiry=float(config.get("llm_keepalive_seconds", 120.0)),
+    )
 
 
 @functools.lru_cache(maxsize=None)
 def _anthropic_takes_tool_choice() -> bool:
     if not CLAUDE_AVAILABLE:
         return False
-    return "tool_choice" in inspect.signature(Anthropic(api_key="probe").messages.create).parameters
+    return "tool_choice" in inspect.signature(_sdk("Anthropic")(api_key="probe").messages.create).parameters
 
 
 @functools.lru_cache(maxsize=None)
@@ -269,9 +316,16 @@ class UnifiedLLMClient:
         self.vllm_endpoint = None
         self.promo_client = None
         self.azure_client = None
+        self._azure_http = None
         self.gemini_client = None
         self.vertex_ai_client = None
         self.claude_client = None
+        # One vLLM session per event loop (see _vllm_session): a session per
+        # call paid a handshake on every completion, and a session is bound to its loop.
+        self._vllm_sessions: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, aiohttp.ClientSession]" = (
+            weakref.WeakKeyDictionary()
+        )
+        self._warm_task: Optional[asyncio.Task] = None
 
         # Provider order (tries in this sequence)
         self.provider_order = []
@@ -312,6 +366,86 @@ class UnifiedLLMClient:
         }.get(provider)
         return f"{provider.value}:{served or 'default'}"
 
+    def _vllm_session(self) -> "aiohttp.ClientSession":
+        import aiohttp
+
+        loop = asyncio.get_running_loop()
+        sessions = getattr(self, "_vllm_sessions", None)
+        if sessions is None:
+            sessions = self._vllm_sessions = weakref.WeakKeyDictionary()
+        session = sessions.get(loop)
+        if session is None or session.closed:
+            session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.config.get('llm_timeout', 120)),
+                connector=aiohttp.TCPConnector(
+                    keepalive_timeout=float(self.config.get("llm_keepalive_seconds", 120.0))
+                ),
+            )
+            sessions[loop] = session
+        return session
+
+    def start_warming(self) -> None:
+        """Open the primary provider's connection in the background.
+
+        The first completion otherwise pays the TCP + TLS handshake (about a
+        second to a distant region). Nothing is sent but a bare request to the
+        provider's own host, and a failure only means the first call connects.
+        """
+        if not self.config.get("llm_prewarm", True) or getattr(self, "_warm_task", None):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._warm_task = loop.create_task(self._warm())
+
+    async def _warm(self) -> None:
+        primary = (getattr(self, "provider_order", None) or [None])[0]
+        azure_http = getattr(self, "_azure_http", None)
+        promo = getattr(self, "promo_client", None)
+        if primary == LLMProvider.AZURE and azure_http is not None:
+            import httpx
+
+            base = httpx.URL(str(self.azure_client.base_url))
+            opening = azure_http.head(f"{base.scheme}://{base.netloc.decode()}/")
+        elif primary == LLMProvider.PROMO and promo is not None:
+            opening = promo.warm()
+        else:
+            return
+        try:
+            await asyncio.wait_for(
+                opening, timeout=float(self.config.get("llm_connect_timeout", 10.0))
+            )
+        except Exception as exc:  # noqa: BLE001 - warming is an optimisation, never a failure
+            logger.debug("LLM connection warm-up skipped: %s", exc)
+
+    async def close(self) -> None:
+        """Release the connections this client holds on the running event loop.
+
+        Called from agent teardown; the client is not used after it.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        warm_task = getattr(self, "_warm_task", None)
+        if warm_task is not None and not warm_task.done():
+            warm_task.cancel()
+            if loop is not None and warm_task.get_loop() is loop:
+                # Before Python 3.12 a cancelled wait_for takes a few more turns of
+                # the loop to finish; nothing of a closed client is left pending.
+                await asyncio.wait({warm_task}, timeout=1.0)
+        sessions = getattr(self, "_vllm_sessions", None) or {}
+        session = sessions.pop(loop, None) if loop is not None else None
+        if session is not None and not session.closed:
+            await session.close()
+        if getattr(self, "promo_client", None) is not None:
+            await self.promo_client.close()
+        if getattr(self, "azure_client", None) is not None:
+            await self.azure_client.close()
+        if getattr(self, "claude_client", None) is not None:
+            self.claude_client.close()
+
 
     def _setup_providers(self):
         """Auto-detect and setup available LLM providers."""
@@ -327,6 +461,7 @@ class UnifiedLLMClient:
                 token=promo_token,
                 timeout=self.config.get("llm_timeout", 120),
                 artifact_dir=self.config.get("promo_raw_artifact_dir", runtime_path("traces", "promo_calls")),
+                keepalive_seconds=float(self.config.get("llm_keepalive_seconds", 120.0)),
             )
             self.provider_order.append(LLMProvider.PROMO)
             logger.info("✓ JarvisCore promotional LLM access configured")
@@ -338,7 +473,13 @@ class UnifiedLLMClient:
 
             if azure_key and azure_endpoint:
                 try:
-                    self.azure_client = AsyncAzureOpenAI(
+                    import httpx
+
+                    self._azure_http = _sdk("DefaultAsyncHttpxClient")(
+                        limits=_connection_limits(self.config),
+                        event_hooks={"response": [self._observe_azure_response]},
+                    )
+                    self.azure_client = _sdk("AsyncAzureOpenAI")(
                         api_key=azure_key,
                         azure_endpoint=azure_endpoint,
                         api_version=self.config.get('azure_api_version', '2024-10-21'),
@@ -348,9 +489,7 @@ class UnifiedLLMClient:
                             self.config.get('llm_timeout', 120),
                             connect=float(self.config.get('llm_connect_timeout', 10.0)),
                         ),
-                        http_client=DefaultAsyncHttpxClient(
-                            event_hooks={"response": [self._observe_azure_response]}
-                        ),
+                        http_client=self._azure_http,
                     )
                     self.provider_order.append(LLMProvider.AZURE)
                     logger.info(f"✓ Azure OpenAI provider available (primary): {azure_endpoint}")
@@ -363,14 +502,16 @@ class UnifiedLLMClient:
             claude_endpoint = self.config.get('claude_endpoint')
             if claude_key:
                 try:
+                    claude_http = _sdk("AnthropicHttpxClient")(limits=_connection_limits(self.config))
                     if claude_endpoint:
-                        self.claude_client = Anthropic(
+                        self.claude_client = _sdk("Anthropic")(
                             api_key=claude_key,
-                            base_url=claude_endpoint
+                            base_url=claude_endpoint,
+                            http_client=claude_http,
                         )
                         logger.info(f"✓ Claude provider available (fallback): {claude_endpoint}")
                     else:
-                        self.claude_client = Anthropic(api_key=claude_key)
+                        self.claude_client = _sdk("Anthropic")(api_key=claude_key, http_client=claude_http)
                         logger.info("✓ Claude provider available (fallback)")
                     self.provider_order.append(LLMProvider.CLAUDE)
                 except Exception as e:
@@ -388,7 +529,7 @@ class UnifiedLLMClient:
             gemini_key = self.config.get('gemini_api_key')
             if gemini_key:
                 try:
-                    self.gemini_client = genai.Client(api_key=gemini_key)
+                    self.gemini_client = _sdk("genai").Client(api_key=gemini_key)
                     self.gemini_model = self.config.get('gemini_model', 'gemini-2.0-flash')
                     self.provider_order.append(LLMProvider.GEMINI)
                     logger.info(f"✓ Gemini provider available: {self.gemini_model}")
@@ -401,7 +542,7 @@ class UnifiedLLMClient:
             vertex_project = self.config.get('vertex_ai_project')
             if vertex_enabled and vertex_project:
                 try:
-                    self.vertex_ai_client = genai.Client(
+                    self.vertex_ai_client = _sdk("genai").Client(
                         vertexai=True,
                         project=vertex_project,
                         location=self.config.get('vertex_ai_location', 'us-central1'),
@@ -561,19 +702,24 @@ class UnifiedLLMClient:
 
         budget_account = current_workflow_budget()
         reservation_id = None
-        if budget_account is not None:
-            input_reservation = multimodal.count_tokens(
-                messages, _TOKEN_COUNTER.count_tokens
+        input_reservation = multimodal.count_tokens(messages, _TOKEN_COUNTER.count_tokens)
+        if kwargs.get("tools"):
+            input_reservation += _TOKEN_COUNTER.count_tokens(
+                json.dumps(kwargs["tools"], ensure_ascii=False, default=str)
             )
-            if kwargs.get("tools"):
-                input_reservation += _TOKEN_COUNTER.count_tokens(
-                    json.dumps(kwargs["tools"], ensure_ascii=False, default=str)
-                )
+        if budget_account is not None:
             if not explicit_allowance:
                 max_tokens = max(
                     1, min(max_tokens, budget_account.headroom() - input_reservation)
                 )
             reservation_id = budget_account.reserve(input_reservation + max_tokens)
+        # Charged to the person the call is made for, against their caps.
+        try:
+            charge = PersonCharge(input_reservation + max_tokens)
+        except BaseException:
+            if budget_account is not None and reservation_id is not None:
+                budget_account.release(reservation_id)
+            raise
 
         try:
             # Acquire concurrency slot before dispatching to any provider.
@@ -593,14 +739,16 @@ class UnifiedLLMClient:
             # Cancellation included: an abandoned call must not hold capacity.
             if budget_account is not None and reservation_id is not None:
                 budget_account.release(reservation_id)
+            charge.release()
             raise
+        usage = result.get("tokens") or {}
         if budget_account is not None and reservation_id is not None:
-            usage = result.get("tokens") or {}
             budget_account.settle(
                 reservation_id,
                 int(usage.get("total") or 0),
                 float(result.get("cost_usd") or 0.0),
             )
+        charge.settle(int(usage.get("total") or 0), float(result.get("cost_usd") or 0.0))
         return result
 
 
@@ -709,6 +857,12 @@ class UnifiedLLMClient:
                         await permit.finish(failed=True)
                     raise
 
+        if not self.provider_order:
+            raise RuntimeError(
+                "No LLM provider is configured. Set one in .env, e.g. CLAUDE_API_KEY, "
+                "AZURE_API_KEY + AZURE_ENDPOINT, GEMINI_API_KEY, JARVISCORE_PROMO_TOKEN "
+                "or LLM_ENDPOINT (see `jarviscore check`)."
+            )
         raise RuntimeError(
             f"All LLM providers failed. Last error: {last_error}\n"
             f"Tried: {[p.value for p in self.provider_order]}"
@@ -790,41 +944,40 @@ class UnifiedLLMClient:
             if kwargs.get(option) is not None:
                 payload[option] = kwargs[option]
 
-        timeout = aiohttp.ClientTimeout(total=self.config.get('llm_timeout', 120))
         start_time = time.time()
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(endpoint, json=payload) as response:
-                if response.status != 200:
-                    error = await response.text()
-                    raise RuntimeError(f"vLLM error {response.status}: {error}")
+        session = self._vllm_session()
+        async with session.post(endpoint, json=payload) as response:
+            if response.status != 200:
+                error = await response.text()
+                raise RuntimeError(f"vLLM error {response.status}: {error}")
 
-                data = await response.json()
-                duration = time.time() - start_time
+            data = await response.json()
+            duration = time.time() - start_time
 
-                message = data['choices'][0]['message']
-                content = message.get('content')
-                usage = data.get('usage', {})
+            message = data['choices'][0]['message']
+            content = message.get('content')
+            usage = data.get('usage', {})
 
-                return {
-                    "content": content,
-                    "provider": "vllm",
-                    **_completion_fields(
-                        data['choices'][0].get("finish_reason"),
-                        usage=usage,
-                        refusal=message.get("refusal"),
-                        tool_calls=message.get("tool_calls"),
-                    ),
-                    "tool_calls": _function_calls(message.get("tool_calls")),
-                    "tokens": {
-                        "input": usage.get('prompt_tokens', 0),
-                        "output": usage.get('completion_tokens', 0),
-                        "total": usage.get('total_tokens', 0)
-                    },
-                    "cost_usd": 0.0,  # vLLM is free (local)
-                    "model": payload['model'],
-                    "duration_seconds": duration
-                }
+            return {
+                "content": content,
+                "provider": "vllm",
+                **_completion_fields(
+                    data['choices'][0].get("finish_reason"),
+                    usage=usage,
+                    refusal=message.get("refusal"),
+                    tool_calls=message.get("tool_calls"),
+                ),
+                "tool_calls": _function_calls(message.get("tool_calls")),
+                "tokens": {
+                    "input": usage.get('prompt_tokens', 0),
+                    "output": usage.get('completion_tokens', 0),
+                    "total": usage.get('total_tokens', 0)
+                },
+                "cost_usd": 0.0,  # vLLM is free (local)
+                "model": payload['model'],
+                "duration_seconds": duration
+            }
 
     # ── Azure Content Filter Mitigation ──────────────────────────────────────
     # Azure's jailbreak detector falsely flags agentic system prompts that

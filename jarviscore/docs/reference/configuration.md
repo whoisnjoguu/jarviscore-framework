@@ -100,6 +100,8 @@ These become important once you run more than two agents concurrently against a 
 |---|---|---|
 | `LLM_TIMEOUT` | `120.0` | Seconds before an LLM call times out. |
 | `LLM_CONNECT_TIMEOUT` | `10.0` | Seconds to establish the connection (TCP and TLS), separate from `LLM_TIMEOUT`. |
+| `LLM_KEEPALIVE_SECONDS` | `120.0` | Seconds an idle provider connection is kept for the next call (Azure, Claude, the promotion endpoint and vLLM). The SDK default of 5 s is shorter than the tool work between agent turns, so most calls reconnected; keep this below your provider's idle timeout (Azure: 240 s). |
+| `LLM_PREWARM` | `true` | Open the primary provider's connection while an agent starts, so its first call skips the TCP and TLS handshake. Only a bare request to the provider's host is sent; a failed warm-up is ignored. |
 | `LLM_TEMPERATURE` | `0.7` | Sampling temperature for all providers. |
 | `LLM_MAX_CONCURRENT` | `0` | Most calls in flight per deployment. `0` leaves the governor to find the level (up to `LLM_CONCURRENCY_CEILING`). With the governor disabled, a process-wide cap. |
 | `LLM_MAX_RETRIES_429` | `4` | Retry attempts when a provider returns 429 before giving up. |
@@ -149,6 +151,7 @@ requires one generative LLM provider from the preceding section.
 | `TYPESAFE_BASE_URL` | TypeSafe SDK default | Optional compatible gateway or test endpoint. |
 | `TYPESAFE_TIMEOUT` | `10.0` | Decision request timeout in seconds. |
 | `KERNEL_ROUTER_PROVIDER` | `llm` | Set to `typesafe` to opt into Jev-backed Kernel role selection. |
+| `KERNEL_ROUTER_MAY_ANSWER` | `true` | Let the router answer, in the same call, a task that needs no role (summarising, rewording, explaining or drafting from the task text, with no tool, data, calculation or action). Applies only when the router runs on the model the communicator would use. |
 | `TYPESAFE_ROUTER_MIN_CONFIDENCE` | `0.5` | Minimum Jev routing confidence. Validate against your workload before changing production behavior. |
 | `TASK_COMPLEXITY_PROVIDER` | `llm` | Set to `typesafe` to classify direct Kernel versus Planner execution with Jev. |
 | `TYPESAFE_COMPLEXITY_MIN_CONFIDENCE` | `0.5` | Below this confidence, preserve the full planning path. |
@@ -202,7 +205,7 @@ These values are `Mesh(config={...})` keys, not environment variables:
 | `workspace_source_catalog` | built-in provider descriptions | Trusted provider descriptions used to resolve explicit source identity from a goal |
 | `workspace_source_resolver` | planning-model resolver | Optional trusted callable that returns source identity before adapter capture |
 | `workspace_snapshot_limits` | framework defaults | Trusted `max_files`, `max_total_bytes`, `max_file_bytes`, and acquisition `concurrency` limits enforced before planning |
-| `workspace_allowed_commands` | `[]` | Additional trusted executable names available to `workspace_run`; caller context cannot expand this list |
+| `workspace_allowed_commands` | `[]` | Additional trusted executable names available to `workspace_run`; caller context cannot expand this list. A node that sets it decides for every step it runs, whoever asked |
 | `workspace_command_timeout_seconds` | `120` | Trusted per-command workspace limit; a timeout is evidence and does not stop the DAG |
 | `workspace_command_environment` | `{}` | Trusted recognized package-manager cache paths passed without inheriting parent secrets |
 | `workspace_delta_ignored_names` | runtime/build defaults | Directory names excluded from persisted deltas, including `.git`, `.venv`, `node_modules`, `output`, and `target` |
@@ -252,8 +255,9 @@ Blob storage is used by agents to persist large outputs (reports, datasets, gene
 
 | Variable | Default | Description |
 |---|---|---|
-| `STORAGE_BACKEND` | `local` | `local` or `azure` |
+| `STORAGE_BACKEND` | `local` | `local`, `azure`, or `redis` (file contents in `REDIS_URL`, so one Redis serves every machine) |
 | `STORAGE_BASE_PATH` | `./.jarviscore/blob_storage` | Base directory path for the local backend |
+| `STORAGE_REDIS_MAX_BLOB_BYTES` | `33554432` | Largest single file the `redis` backend accepts |
 | `AZURE_STORAGE_CONNECTION_STRING` | (none) | Required when `STORAGE_BACKEND=azure` |
 
 For Azure:
@@ -277,6 +281,7 @@ AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=...
 |---|---|---|
 | `RESEARCH_GROUNDED_TIMEOUT_SECONDS` | `45` | Per-call deadline for Google Grounded (generative search) |
 | `RESEARCH_SEARCH_TIMEOUT_SECONDS` | `15` | Per-call deadline for each other search provider |
+| `RESEARCH_ALLOW_WIKIPEDIA_FALLBACK` | `false` | Search Wikipedia when no other provider found anything, even with web providers configured |
 
 Both `InternetSearch` implementations accept `grounded_timeout_seconds` and
 `search_timeout_seconds` keyword arguments, which take precedence over these
@@ -361,7 +366,7 @@ JarvisCore supplies no IP addresses. To give agents a reputable, stable or regio
 | `EGRESS_PROXY_URL` | (none) | `http://` or `https://` proxy, e.g. `http://user-session-{session}:pass@gw.provider.example:7000`. `{session}` becomes a stable 16-character id per tenant profile or workflow, so a provider that pins an exit IP per session keeps one IP for a login or checkout. |
 | `EGRESS_PROXY_BYPASS` | (none) | Comma-separated hosts that go direct, e.g. `searxng,.internal`. Loopback always goes direct. |
 
-See [Browser Automation: Your own proxy](../guides/browser-automation.md#your-own-proxy).
+See [Browser Automation: Your own proxy](browser.md#your-own-proxy).
 
 ---
 
@@ -372,6 +377,7 @@ Required only when agents call third-party services (GitHub, Slack, Jira, Stripe
 | Variable | Default | Description |
 |---|---|---|
 | `NEXUS_GATEWAY_URL` | (none) | Gateway URL, e.g. `http://localhost:8090` |
+| `NEXUS_GATEWAY_API_KEY` | (none) | Sent as `X-API-Key` on every Gateway call. Written by `jarviscore nexus init`. Grants Gateway access only, never the broker's encryption key. |
 | `NEXUS_BROKER_URL` | (none) | Broker URL, e.g. `http://localhost:8080`. Used by dashboard and SDK to POST credentials directly to the Broker's `/auth/capture-credential` endpoint for non-OAuth providers. |
 | `NEXUS_RETURN_URL` | `http://localhost:8000/oauth/callback` | OAuth callback URL; the Nexus broker redirects here after consent. |
 | `NEXUS_DEFAULT_USER_ID` | `jarviscore-agent` | User identity passed to Nexus for credential lookups. |
@@ -384,11 +390,11 @@ Initial setup:
 
 ```bash
 jarviscore nexus init
-jarviscore nexus register github \
-    --client-id=YOUR_ID \
-    --client-secret=YOUR_SECRET
+jarviscore nexus register github --client-id=YOUR_ID   # prompts for the secret
 jarviscore nexus test github
 ```
+
+The local stack's own secrets (`NEXUS_ENCRYPTION_KEY`, `NEXUS_STATE_KEY`, `NEXUS_BROKER_API_KEY`) live in `~/.jarviscore/nexus/stack.env` and are read by the broker and gateway containers only. Do not put them in a project `.env`.
 
 ---
 
@@ -426,6 +432,7 @@ Advanced execution parameters for the OODA loop Kernel. The defaults are appropr
 | `HITL_ENABLED` | `false` | Enable Human-in-the-Loop escalation. |
 | `HITL_MAX_CONFIDENCE` | `0.8` | Escalate when the Kernel's action confidence is below this value. |
 | `HITL_MIN_RISK_SCORE` | `0.7` | Escalate when the evaluated risk score exceeds this value. |
+| `HITL_TARGETS` | `reviewer` | Who responds to escalations, comma-separated (e.g. `ops-oncall,finance-approver`). Carried on every request as `targets`; a request can name its own. See [Who responds](../guides/hitl.md#who-responds). |
 | `MAX_GOAL_STEPS` | `30` | Hard ceiling on plan steps for goal-oriented agents before the goal is marked `blocked`. |
 | `MAX_REPLAN_ATTEMPTS` | `8` | Maximum replanning cycles before the Kernel returns a failure result. |
 

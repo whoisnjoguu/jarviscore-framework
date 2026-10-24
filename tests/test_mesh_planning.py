@@ -1808,3 +1808,33 @@ async def test_mesh_planner_requires_one_provider_for_mutating_outcomes(systems)
 
     with pytest.raises(MeshPlanError, match="exactly one system"):
         await planner.plan("Find evidence")
+
+@pytest.mark.asyncio
+async def test_the_audit_knows_proposing_is_how_shared_files_change():
+    """A redo on a room's files was refused: the audit demanded a `write` nobody can do."""
+    llm = MockLLMClient(responses=responses() + responses())
+    planner = MeshPlanner(llm, capabilities={"research": "Research evidence"})
+
+    await planner.plan("Find evidence", {"source_snapshot": {"snapshot_id": "s1"}})
+    await planner.plan("Find evidence", {})
+
+    with_files = llm.calls[2]["messages"][0]["content"]
+    without_files = llm.calls[5]["messages"][0]["content"]
+    assert "Never require a `write` or a system to edit them" in with_files
+    assert "including a redo of an earlier attempt" in with_files
+    assert "Never require a `write` or a system to edit them" not in without_files
+
+
+@pytest.mark.asyncio
+async def test_a_plan_cut_off_by_the_output_allowance_says_how_to_raise_it():
+    """A reasoning model can spend its whole allowance thinking and return no plan."""
+
+    class Exhausted:
+        async def generate(self, **_):
+            return {"content": "", "finish_reason": "length", "model": "gpt-5.6-luna",
+                    "tokens": {"output": 4000}}
+
+    with pytest.raises(MeshPlanError) as error:
+        await MeshPlanner(Exhausted(), capabilities={"research": "Find evidence"}).plan("Find evidence")
+    assert "LLM_MODEL_OUTPUT_LIMITS" in str(error.value)
+    assert '"gpt-5.6-luna": 32000' in str(error.value)

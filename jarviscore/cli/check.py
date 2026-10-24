@@ -11,10 +11,11 @@ Usage:
 
 import sys
 import os
-import asyncio
 from pathlib import Path
 from typing import Dict, List, Tuple
 import importlib.util
+
+LLM_TEST_TIMEOUT = 15.0
 
 
 class HealthChecker:
@@ -60,6 +61,14 @@ class HealthChecker:
         """Check if jarviscore package is installed."""
         try:
             import jarviscore
+            # `import jarviscore` is lazy; load the runtime graph and installed SDKs it used to.
+            import jarviscore.core.mesh  # noqa: F401
+            for sdk in ("google.genai", "openai", "anthropic"):
+                try:
+                    if importlib.util.find_spec(sdk) is not None:
+                        importlib.import_module(sdk)
+                except ImportError:
+                    pass
             version = getattr(jarviscore, '__version__', '0.1.0')
             self.successes.append(f"JarvisCore {version} installed")
             self._print_status("JarvisCore Package", True, f"v{version}")
@@ -214,35 +223,30 @@ class HealthChecker:
         from dotenv import load_dotenv
         load_dotenv()
 
-        # Try each configured provider
-        for provider, is_configured in configured.items():
-            if not is_configured:
-                continue
+        # Test configured providers concurrently; report in the fixed provider order.
+        tests = {
+            "JarvisCore Promotion": self._test_promo,
+            "Claude": self._test_claude,
+            "Azure OpenAI": self._test_azure,
+            "Gemini": self._test_gemini,
+            "vLLM": self._test_vllm,
+        }
+        selected = [p for p, is_configured in configured.items() if is_configured and p in tests]
+        import asyncio
 
-            try:
-                if provider == "JarvisCore Promotion":
-                    success = await self._test_promo()
-                elif provider == "Claude":
-                    success = await self._test_claude()
-                elif provider == "Azure OpenAI":
-                    success = await self._test_azure()
-                elif provider == "Gemini":
-                    success = await self._test_gemini()
-                elif provider == "vLLM":
-                    success = await self._test_vllm()
-                else:
-                    continue
-
-                if success:
-                    self.successes.append(f"{provider} connectivity OK")
-                    self._print_status(f"  {provider} API", True, "Connected")
-                else:
-                    self.issues.append(f"{provider} connection failed")
-                    self._print_status(f"  {provider} API", False, "Connection failed")
-
-            except Exception as e:
-                self.issues.append(f"{provider} test failed: {str(e)}")
-                self._print_status(f"  {provider} API", False, str(e))
+        outcomes = await asyncio.gather(
+            *(tests[p]() for p in selected), return_exceptions=True
+        )
+        for provider, outcome in zip(selected, outcomes):
+            if isinstance(outcome, BaseException):
+                self.issues.append(f"{provider} test failed: {str(outcome)}")
+                self._print_status(f"  {provider} API", False, str(outcome))
+            elif outcome:
+                self.successes.append(f"{provider} connectivity OK")
+                self._print_status(f"  {provider} API", True, "Connected")
+            else:
+                self.issues.append(f"{provider} connection failed")
+                self._print_status(f"  {provider} API", False, "Connection failed")
 
     async def _test_promo(self) -> bool:
         """Test promotional inference with the public client contract."""
@@ -251,7 +255,7 @@ class HealthChecker:
         token = os.getenv("JARVISCORE_PROMO_TOKEN")
         if not token:
             return False
-        client = PromoLLMClient(token=token)
+        client = PromoLLMClient(token=token, timeout=LLM_TEST_TIMEOUT)
         response = await client.generate(
             [{"role": "user", "content": "Reply with just 'OK'"}],
             temperature=0.0,
@@ -262,13 +266,18 @@ class HealthChecker:
     async def _test_claude(self) -> bool:
         """Test Claude API connectivity."""
         try:
+            import httpx
             from anthropic import AsyncAnthropic
 
             api_key = os.getenv('CLAUDE_API_KEY') or os.getenv('ANTHROPIC_API_KEY')
             if not api_key:
                 return False
 
-            client = AsyncAnthropic(api_key=api_key)
+            client = AsyncAnthropic(
+                api_key=api_key,
+                timeout=httpx.Timeout(LLM_TEST_TIMEOUT, connect=5),
+                max_retries=0,
+            )
 
             # Simple test message
             response = await client.messages.create(
@@ -285,12 +294,15 @@ class HealthChecker:
     async def _test_azure(self) -> bool:
         """Test Azure OpenAI connectivity."""
         try:
-            from openai import AsyncAzureOpenAI
+            import httpx
+            from openai import AsyncAzureOpenAI, BadRequestError
 
             client = AsyncAzureOpenAI(
                 api_key=os.getenv('AZURE_API_KEY') or os.getenv('AZURE_OPENAI_KEY'),
                 api_version=os.getenv('AZURE_API_VERSION', '2024-10-21'),
-                azure_endpoint=os.getenv('AZURE_ENDPOINT')
+                azure_endpoint=os.getenv('AZURE_ENDPOINT'),
+                timeout=httpx.Timeout(LLM_TEST_TIMEOUT, connect=5),
+                max_retries=0,
             )
 
             deployment = os.getenv('AZURE_DEPLOYMENT', 'gpt-4o')
@@ -301,7 +313,9 @@ class HealthChecker:
                     messages=[{"role": "user", "content": "Reply with just 'OK'"}],
                     max_completion_tokens=10,
                 )
-            except Exception:
+            except BadRequestError as exc:
+                if "max_completion_tokens" not in str(exc) and "max_tokens" not in str(exc):
+                    raise
                 # Fall back to max_tokens for older deployments (gpt-4o, gpt-4)
                 response = await client.chat.completions.create(
                     model=deployment,
@@ -322,9 +336,14 @@ class HealthChecker:
             client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
             model_name = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash')
 
-            response = await client.aio.models.generate_content(
-                model=model_name,
-                contents="Reply with just 'OK'"
+            import asyncio
+
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=model_name,
+                    contents="Reply with just 'OK'"
+                ),
+                LLM_TEST_TIMEOUT,
             )
             return 'OK' in response.text.upper()
 
@@ -387,10 +406,10 @@ class HealthChecker:
             print("\n" + "="*70)
             print("  Next Steps")
             print("="*70)
-            print("\n1. Initialize project:")
-            print("   jarviscore init")
+            print("\n1. Create a project (or run this inside one):")
+            print("   jarviscore init my-agents && cd my-agents")
             print("\n2. Configure your environment:")
-            print("   cp .env.example .env")
+            print("   cp .env.example .env   # if .env is missing")
             print("   # Edit .env and add one of:")
             print("   #   JARVISCORE_PROMO_TOKEN=jc_trial_...")
             print("   #   CLAUDE_API_KEY=sk-ant-...")
@@ -399,8 +418,8 @@ class HealthChecker:
             print("   #   LLM_ENDPOINT=http://localhost:8000 (for local vLLM)")
             print("\n3. Run health check again:")
             print("   jarviscore check --validate-llm")
-            print("\n4. Try the quickstart:")
-            print("   python examples/quickstart.py")
+            print("\n4. Run your agents:")
+            print("   jarviscore dev")
             print()
 
             return False
@@ -408,8 +427,8 @@ class HealthChecker:
         print("\n✓ All checks passed! Ready to use JarvisCore.\n")
         print("Next steps:")
         print("  1. Run smoke test:    jarviscore smoketest")
-        print("  2. Try quickstart:    python examples/quickstart.py")
-        print("  3. Full example set:  jarviscore init --examples")
+        print("  2. New project:       jarviscore init my-agents")
+        print("  3. Run it locally:    cd my-agents && jarviscore dev")
         print()
 
         return True
@@ -465,6 +484,61 @@ class HealthChecker:
         return self.print_summary()
 
 
+def run_production_profile(destination, as_json: bool, connect: bool = True) -> int:
+    """Production checklist for a jarviscore.yaml project. Exit 1 on any error."""
+    import json
+
+    from jarviscore.project import ProjectError, find_root, load_project
+    from jarviscore.project.checks import ERROR, has_errors
+    from jarviscore.project.checks.production import run_production_checks
+
+    defaulted = False
+    if destination is None:
+        try:
+            # A production checklist belongs to the prod overlay when the project has one.
+            if (find_root() / "jarviscore.prod.yaml").is_file():
+                destination, defaulted = "prod", True
+        except ProjectError:
+            pass  # load_project reports it below
+    try:
+        loaded = load_project(destination=destination)
+    except ProjectError as exc:
+        if as_json:
+            print(json.dumps({"ok": False, "error": str(exc), "results": []}, indent=2))
+        else:
+            print(f"✗ {exc}", file=sys.stderr)
+        return 2
+
+    results = run_production_checks(loaded, dict(os.environ), connect=connect)
+    ok = not has_errors(results)
+    if as_json:
+        print(json.dumps({
+            "ok": ok,
+            "service": loaded.project.service,
+            "environment": loaded.environment,
+            "results": [r.as_dict() for r in results],
+        }, indent=2))
+        return 0 if ok else 1
+
+    if defaulted:
+        where = f"{loaded.environment}, from jarviscore.prod.yaml; pass -d <env> for another"
+    elif destination is None:
+        where = f"{loaded.environment}: jarviscore.yaml only; pass -d <env> to check a deployment"
+    else:
+        where = loaded.environment
+    print(f"\nProduction checks: {loaded.project.service} ({where})\n")
+    icons = {True: "✓", ERROR: "✗"}
+    for r in sorted(results, key=lambda r: (r.ok, r.severity != ERROR)):
+        icon = icons[True] if r.ok else icons.get(r.severity, "⚠")
+        print(f"  {icon} {r.message}")
+        if not r.ok and r.fix:
+            print(f"      → {r.fix}")
+    errors = sum(1 for r in results if not r.ok and r.severity == ERROR)
+    warnings = sum(1 for r in results if not r.ok and r.severity != ERROR)
+    print(f"\n{'✓ Ready' if ok else '✗ Not ready'}: {errors} error(s), {warnings} warning(s)\n")
+    return 0 if ok else 1
+
+
 def main():
     """CLI entry point."""
     import argparse
@@ -487,14 +561,45 @@ def main():
         action='store_true',
         help='Show detailed information'
     )
+    parser.add_argument(
+        '--profile',
+        choices=['prod'],
+        help='Run the production checklist against jarviscore.yaml instead of the local health check'
+    )
+    parser.add_argument(
+        '-d', '--destination',
+        help='Environment overlay for --profile prod (jarviscore.<destination>.yaml)'
+    )
+    parser.add_argument(
+        '--json',
+        action='store_true',
+        help='Machine-readable output for --profile prod'
+    )
+    parser.add_argument(
+        '--no-connect',
+        action='store_true',
+        help='With --profile prod, skip checks that connect to external services'
+    )
 
     args = parser.parse_args()
+
+    if args.profile is None:
+        profile_only = [flag for flag, used in (
+            ('--json', args.json), ('-d/--destination', args.destination is not None),
+            ('--no-connect', args.no_connect)) if used]
+        if profile_only:
+            parser.error(f"{', '.join(profile_only)} requires --profile prod")
+
+    if args.profile == 'prod':
+        sys.exit(run_production_profile(args.destination, args.json, connect=not args.no_connect))
 
     checker = HealthChecker(
         validate_llm=args.validate_llm,
         validate_typesafe=args.validate_typesafe,
         verbose=args.verbose
     )
+
+    import asyncio
 
     success = asyncio.run(checker.run())
     sys.exit(0 if success else 1)

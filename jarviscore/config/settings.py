@@ -74,6 +74,13 @@ class Settings(BaseSettings):
     llm_timeout: float = 120.0
     # Connecting (TCP + TLS) gets its own short limit; the SDK retries a failed connect.
     llm_connect_timeout: float = 10.0
+    # Seconds an idle provider connection is kept for the next call. The SDKs
+    # default to 5 s, shorter than the tool work between agent turns, so most
+    # calls paid a new TCP + TLS handshake (about 1 s to a distant region).
+    llm_keepalive_seconds: float = 120.0
+    # Open the primary provider's connection while an agent starts, so its
+    # first call does not pay the handshake.
+    llm_prewarm: bool = True
     llm_temperature: float = 0.7
     # Output cap when a caller passes none. Reasoning deployments bill hidden
     # reasoning against it, so a low cap returns empty or truncated completions.
@@ -179,8 +186,9 @@ class Settings(BaseSettings):
     redis_max_step_output_bytes: int = 10 * 1024 * 1024
 
     # === Blob Storage ===
-    storage_backend: str = "local"  # "local" or "azure"
+    storage_backend: str = "local"  # "local", "azure", or "redis" (uses REDIS_URL)
     storage_base_path: str = runtime_path("blob_storage")
+    storage_redis_max_blob_bytes: int = 32 * 1024 * 1024  # per file, with storage_backend="redis"
     azure_storage_connection_string: Optional[str] = None
     azure_storage_container: str = "jarviscore"
 
@@ -197,6 +205,9 @@ class Settings(BaseSettings):
     kernel_action_budget: int = 24000
     kernel_wall_clock_ms: int = 180000
     kernel_router_provider: str = "llm"
+    # Let the router answer a task that needs no role (no tools, data or effects)
+    # in the same call, when it runs on the model the communicator would use.
+    kernel_router_may_answer: bool = True
     typesafe_router_min_confidence: float = 0.5
     task_complexity_provider: str = "llm"
     typesafe_complexity_min_confidence: float = 0.5
@@ -251,12 +262,15 @@ class Settings(BaseSettings):
     hitl_enabled: bool = False
     hitl_max_confidence: float = 0.8
     hitl_min_risk_score: float = 0.7
+    #: Who responds to escalations (comma-separated), e.g. "ops-oncall,finance-approver".
+    hitl_targets: str = "reviewer"
 
     # === Auth / Nexus ===
     # Nexus is the ONLY auth path — there is no dev-mode bypass.
     # All credential types (OAuth, api_key, basic_auth) go through Nexus.
     # Set NEXUS_GATEWAY_URL to enable any connected-app functionality.
     nexus_gateway_url: Optional[str] = None  # NEXUS_GATEWAY_URL — required for connected apps
+    nexus_gateway_api_key: Optional[str] = None  # NEXUS_GATEWAY_API_KEY — sent as X-API-Key; `jarviscore nexus init` writes it for the local stack
     nexus_return_url: str = "http://localhost:8000/oauth/callback"  # Broker redirects here after consent
     nexus_default_user_id: str = "jarviscore-agent"
     nexus_enabled: Optional[bool] = None  # NEXUS_ENABLED — explicit override; None = auto-detect from nexus_gateway_url

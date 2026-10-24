@@ -35,8 +35,10 @@ from jarviscore.orchestration.envelopes import (
     neutral_context,
 )
 from jarviscore.kernel.cognition import AgentCognitionManager
+from jarviscore.kernel.workspace_tools import register_workspace_tools
 from jarviscore.context.fidelity import Record, select_whole
 from jarviscore.kernel.hitl import AdaptiveHITLPolicy
+from jarviscore.auth.spending import SpendCapReached
 from jarviscore.orchestration.budget import WorkflowBudgetExceeded
 from jarviscore.promo import PROMO_MODEL
 
@@ -76,6 +78,12 @@ class RoutingDecision:
     model: Optional[str] = None
     usage: Optional[Dict[str, int]] = None
     cost_usd: float = 0.0
+    #: The router's own complete answer, when the task needed no role at all.
+    answer: Optional[str] = None
+
+
+#: The route that is no role: the router answered the task in the same call.
+ANSWERED_ROUTE = "answer"
 
 
 class TaskRouter:
@@ -115,9 +123,17 @@ is API work even when it never says so: sending it to browser lands on that
 provider's sign-in page and asks a human to log in by hand to something they
 already granted, or could grant with one click.
 
+Answering directly:
+When the payload carries may_answer: true and the whole task can be done from the task
+text alone (summarising, rewording, explaining, classifying or drafting what it gives you,
+with no tool, lookup, file, code, calculation to work out, current information, other
+agent or action), do not route it: return "role": "answer" and put the complete answer
+for the person who asked in "answer", following agent_instructions. A result that must be
+computed or verified is never answered here. When in any doubt, route it.
+
 Use the task, context summary, agent default role, and available registry/handoff context.
 For custom roles, use role_catalog from the payload as the authoritative contract.
-Do not use keyword matching. If the task asks for missing access/data/founder input, route to
+Do not use keyword matching. If the task asks for missing access/data/a person's input, route to
 communicator unless it explicitly requires browser UI work. Prefer coder only when executable
 processing is actually required.
 """
@@ -155,6 +171,8 @@ processing is actually required.
         task: str,
         context: Optional[Dict[str, Any]] = None,
         agent_default_role: Optional[str] = None,
+        may_answer: bool = False,
+        agent_instructions: str = "",
     ) -> RoutingDecision:
         if self.provider == "typesafe":
             return await self._route_with_typesafe(
@@ -173,6 +191,10 @@ processing is actually required.
             "valid_roles": sorted(self.valid_roles),
             "role_catalog": self.role_catalog,
         }
+        if may_answer:
+            payload["may_answer"] = True
+            if agent_instructions:
+                payload["agent_instructions"] = agent_instructions
         messages = [
             {"role": "system", "content": self._SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
@@ -180,9 +202,11 @@ processing is actually required.
         kwargs: Dict[str, Any] = {
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 500,
             "response_format": {"type": "json_object"},
         }
+        if not may_answer:
+            # A route is a few words; an answer is as long as the task needs.
+            kwargs["max_tokens"] = 500
         if self.model:
             kwargs["model"] = self.model
         try:
@@ -198,6 +222,22 @@ processing is actually required.
         content = response.get("content", "") if isinstance(response, dict) else str(response)
         data = self._parse_json_object(content)
         role = str(data.get("role", "")).lower().strip()
+        if may_answer and role == ANSWERED_ROUTE:
+            answer = str(data.get("answer") or "").strip()
+            finish = str((response or {}).get("finish_reason") or "").lower() if isinstance(response, dict) else ""
+            if answer and finish not in {"length", "max_tokens", "content_filter"}:
+                return RoutingDecision(
+                    role=ANSWERED_ROUTE,
+                    confidence=1.0,
+                    reason=str(data.get("reason", ""))[:500] or "Answered from the task text.",
+                    provider="llm",
+                    usage=dict(response.get("tokens") or {}) if isinstance(response, dict) else None,
+                    cost_usd=float(response.get("cost_usd") or 0.0) if isinstance(response, dict) else 0.0,
+                    answer=answer,
+                )
+            # An empty or cut-off answer is not an answer: the task goes to a role.
+            role = "communicator" if "communicator" in self.valid_roles else ""
+            data = {**data, "confidence": 1.0}
         if role not in self.valid_roles:
             raise RoutingError(f"Kernel router returned invalid role {role!r}: {content[:300]}")
 
@@ -450,6 +490,12 @@ class Kernel:
             subagent.mailbox = self.mailbox
         if hasattr(subagent, "peers"):
             subagent.peers = self.peers
+        # Peer tools are offered only while another agent is reachable through this.
+        subagent.peer_directory = self.peers
+        # Tool programs run in the Kernel's sandbox, never in this process.
+        subagent.program_sandbox = self.sandbox
+        # What each tool returns is learned once per agent, not once per step.
+        subagent._result_shapes = self.__dict__.setdefault("_tool_result_shapes", {})
         subagent.decision_client = self.decision_client
         subagent.rag_decision_provider = str(
             self.config.get("rag_decision_provider", "vector")
@@ -804,10 +850,15 @@ class Kernel:
         if reachable:
             routing_context["providers_reachable_by_api"] = reachable
 
+        answering = (
+            {"may_answer": True, "agent_instructions": str((context or {}).get("system_prompt") or "")}
+            if self._router_may_answer(context) else {}
+        )
         decision = await self._task_router.route(
             task=task,
             context=routing_context,
             agent_default_role=agent_default_role,
+            **answering,
         )
 
         if credentialed and decision.role not in CREDENTIALED_ROLES:
@@ -821,6 +872,39 @@ class Kernel:
                 system_name, decision.role, decision.reason,
             )
         return decision
+
+    #: Step context that means the work needs a role: a provider, files, an effect,
+    #: a declared output, earlier steps' results, or a known function to reuse.
+    _NEEDS_A_ROLE = (
+        "system", "systems", "effect", "workspace_binding", "output_schema",
+        "previous_step_results", "registry_candidate", "execution_contract",
+        "_goal", "browser_reads",
+    )
+
+    def _router_may_answer(self, context: Optional[Dict]) -> bool:
+        """Whether the router may answer the task itself instead of naming a role.
+
+        Only where no role is needed and the router runs on the very model the
+        communicator would: answering then saves a round trip, never a model.
+        """
+        router = getattr(self, "_task_router", None)
+        profiles = getattr(self, "_role_lease_profiles", None) or {}
+        config = getattr(self, "config", None) or {}
+        # Only the built-in router knows how to answer; a replaced one is left as it is.
+        if not isinstance(router, TaskRouter) or router.provider != "llm":
+            return False
+        if not config.get("kernel_router_may_answer", True) or "communicator" not in profiles:
+            return False
+        if any((context or {}).get(key) for key in self._NEEDS_A_ROLE):
+            return False
+        profile = profiles["communicator"]
+        try:
+            communicator_model = self._get_model_for_tier(
+                profile.get("model_tier", "task"), complexity=profile.get("complexity"),
+            )
+        except Exception:  # noqa: BLE001 - an unresolvable tier never answers
+            return False
+        return communicator_model == router.model
 
     async def _provider_inventory(self) -> Dict[str, str]:
         """Providers this deployment can reach through Nexus, and their state.
@@ -986,6 +1070,51 @@ class Kernel:
         self._attach_mesh_tools(subagent)
         return subagent
 
+    def _equip_for_step(self, subagent, context: Optional[Dict[str, Any]]) -> None:
+        """Give the sub-agent what this step needs beyond its own tools.
+
+        A step bound to files (a room, a repository) is done in those files,
+        whichever role the router chose, so that role can open and change them.
+        """
+        if (context or {}).get("workspace_binding") and "workspace_write" not in subagent._tools:
+            register_workspace_tools(subagent, lambda: self.sandbox)
+
+    def _room_memory(self, context: Optional[Dict[str, Any]], workflow_id: str) -> Dict[str, Any]:
+        """Memory for a step in a room: the room's tenant and scope, the team's
+        session, and, for work done for someone, their private memory in the room.
+
+        Every agent working in a room shares what the room's agents and people
+        keep there. What a piece of work learns through its asker's own access to
+        a system the room does not share goes to that person's private memory
+        instead, and work that recalls private memory is private work: its result
+        is held for that person like any other private work.
+        """
+        context = context or {}
+        room_key = str(context.get("room_id") or "")
+        if "/" not in room_key:
+            return {}
+        tenant = room_key.split("/", 1)[0]
+        target: Dict[str, Any] = {"memory_scope": room_key, "memory_tenant": tenant, "team_agent": "room"}
+        person = str(context.get("acting_for") or "")
+        if not person.startswith(f"{tenant}/") or not isinstance(context.get("room"), dict):
+            return target  # the room's conversation, or work for no one: shared memory only
+        store = self.redis_store
+        target["private_scope"] = f"{room_key}#private:{person.split('/', 1)[1]}"
+
+        def is_private() -> bool:
+            if store is None:
+                return True  # cannot tell: keep it private
+            shared = set((store.get_room_meta(room_key) or {}).get("shared_connectors") or [])
+            return any(str(s.get("provider", "")).lower() not in shared
+                       for s in store.workflow_sources(workflow_id))
+
+        def on_private_recall() -> None:
+            if store is not None:
+                store.record_workflow_source(workflow_id, "memory", person)
+
+        target.update(is_private=is_private, on_private_recall=on_private_recall)
+        return target
+
     def _memory_scope(self, context: Optional[Dict[str, Any]]) -> Optional[str]:
         """Which tenant this step's memory belongs to.
 
@@ -1034,7 +1163,8 @@ class Kernel:
                     else:
                         logger.debug("[Kernel] Athena memory tier not configured: %s", exc)
 
-                memory_scope = self._memory_scope(context)
+                room = self._room_memory(context, workflow_id)
+                memory_scope = room.get("memory_scope") or self._memory_scope(context)
                 scope_field = self.config.get("memory_scope_field")
                 if athena_client is not None and scope_field and memory_scope is None:
                     # The mesh separates tenants by this field and the step
@@ -1067,6 +1197,7 @@ class Kernel:
                     memory_scope=memory_scope,
                     memory_identity=self.memory_identity,
                     local_memory=local_memory,
+                    **{k: v for k, v in room.items() if k != "memory_scope"},
                 )
         except ImportError:
             logger.debug("[Kernel] UnifiedMemory not available — running without memory")
@@ -1284,6 +1415,13 @@ class Kernel:
                     use_default_role_as_fallback=use_default_role_as_fallback,
                 )
             except WorkflowBudgetExceeded as budget_exc:
+                if isinstance(budget_exc, SpendCapReached):
+                    return AgentOutput(
+                        status="failure", payload={"error": str(budget_exc), "stage": "spend_cap"},
+                        summary=str(budget_exc), trajectory=[],
+                        metadata={"tokens": total_tokens, "cost_usd": total_cost, "dispatches": dispatches,
+                                  "typed_outcome": "SPEND_CAP_REACHED"},
+                    )
                 logger.info("[Kernel] Routing exhausted the active workflow epoch")
                 return AgentOutput(
                     status="epoch_exhausted",
@@ -1315,6 +1453,26 @@ class Kernel:
                         "dispatches": dispatches,
                         "elapsed_ms": (time.time() - start_time) * 1000,
                         "routing_error": str(route_exc),
+                    },
+                )
+            if routing.role == ANSWERED_ROUTE and routing.answer:
+                # The router answered from the task text: no role, no further call.
+                answered_usage = routing.usage or {}
+                for key in ("input", "output", "total"):
+                    total_tokens[key] += int(answered_usage.get(key) or 0)
+                total_cost += routing.cost_usd
+                _kernel_trace.log_step_complete(True, routing.answer)
+                return AgentOutput(
+                    status="success",
+                    payload={},
+                    summary=routing.answer,
+                    metadata={
+                        "tokens": total_tokens,
+                        "cost_usd": total_cost,
+                        "answer": routing.answer,
+                        "answered_by": "router",
+                        "routing": {"role": ANSWERED_ROUTE, "reason": routing.reason},
+                        "elapsed_ms": (time.time() - start_time) * 1000,
                     },
                 )
             role = routing.role
@@ -1395,6 +1553,7 @@ class Kernel:
             subagent = self._get_or_create_subagent(
                 role, agent_id, step_id
             )
+            self._equip_for_step(subagent, context)
 
             # Build enriched context with system prompt
             enriched_context["workflow_id"] = workflow_id

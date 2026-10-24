@@ -48,6 +48,24 @@ from jarviscore.config.paths import runtime_path
 
 logger = logging.getLogger(__name__)
 
+
+def _user_site_environment() -> Dict[str, str]:
+    """Give the scrubbed child the parent's user site-packages, and nothing else.
+
+    The child's HOME is the workspace, so Python would otherwise look for user
+    packages there: a `pip install --user` of JarvisCore could not import its
+    own dependencies, and code could plant packages for later runs. Pointing
+    PYTHONUSERBASE at the parent's (read-only under confinement) user base, or
+    disabling user site when the parent has none, mirrors the parent exactly.
+    """
+    import site
+
+    user_site = site.getusersitepackages() if site.ENABLE_USER_SITE else None
+    if user_site and user_site in sys.path:
+        return {"PYTHONUSERBASE": site.getuserbase()}
+    return {"PYTHONNOUSERSITE": "1"}
+
+
 # ─────────────────────────────────────────────────────────────────
 # Result Model
 # ─────────────────────────────────────────────────────────────────
@@ -495,10 +513,10 @@ class CoderSandbox:
         browser_proxy=None,  # Optional[PageBroker]: the page, for browser code
     ):
         self.workspace = Path(workspace_dir) if workspace_dir else Path.cwd()
+        self.workspace.mkdir(parents=True, exist_ok=True)
         self.timeout = timeout
         # created lazily at execute() time; idle sandbox leaves no dir
         self.output_dir = self.workspace / output_subdir
-        self.output_dir.mkdir(parents=True, exist_ok=True)
         # Where a run's files end up is the developer's choice: any BlobStorage
         # backend, local or remote. The sandbox only decides that they leave.
         self.blob_storage = blob_storage
@@ -536,7 +554,7 @@ class CoderSandbox:
             workspace_dir=workspace_dir,
             timeout=self.timeout,
             bash_timeout=bash_timeout or self._bash.timeout,
-            output_subdir=self.output_dir.name,
+            output_subdir=self._output_subdir(),
             nexus_call_proxy=self._nexus_call_proxy,
             mesh_proxy=self._mesh_proxy,
             blob_storage=self.blob_storage,
@@ -548,6 +566,14 @@ class CoderSandbox:
             },
             allow_unsafe_local_execution=self.allow_unsafe_local_execution,
         )
+
+    def _output_subdir(self) -> str:
+        # The whole relative path: just the last part would put the runtime's output
+        # folder at ``<workspace>/output``, among the project's own files.
+        try:
+            return self.output_dir.relative_to(self.workspace).as_posix()
+        except ValueError:
+            return runtime_path("output")
 
     def _workspace_path(self, relative: str = ".") -> Path:
         candidate = (self.workspace / relative).resolve()
@@ -850,6 +876,8 @@ class CoderSandbox:
             "allow_unsafe_local_execution": self.allow_unsafe_local_execution,
             "browser": self.browser_proxy is not None,
             "browser_session": self.browser_proxy is not None,
+            # The agent's tools the program may call, by name and argument order.
+            "tools": (context or {}).get("_tool_signatures") or {},
         }
         command_dirs = {
             str(Path(found).parent)
@@ -863,6 +891,7 @@ class CoderSandbox:
             "TMPDIR": str(self.workspace / ".tmp"),
             "LANG": "C.UTF-8",
             "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+            **_user_site_environment(),
         }
         Path(safe_env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
         from jarviscore.execution.isolation import confinement_prefix
@@ -1084,6 +1113,12 @@ class CoderSandbox:
                         if isinstance(content, str):
                             content = content.encode()
                         result = {"content": base64.b64encode(content).decode("ascii")}
+                    elif request["operation"] == "tool_call":
+                        bridge = context.get("_tool_bridge")
+                        if not callable(bridge):
+                            raise RuntimeError("This program was not given any tools.")
+                        payload = request["payload"]
+                        result = await bridge(str(payload.get("name") or ""), payload.get("params") or {})
                     elif request["operation"] == "mesh_list_peers":
                         if self._mesh_proxy is None:
                             raise RuntimeError("No mesh is attached to this agent.")
@@ -1516,6 +1551,8 @@ class CoderSandbox:
 
     def _snapshot_output(self) -> Dict[str, float]:
         """Modification times under output_dir, to tell apart what a run produced."""
+        # runs before every execution, so generated code always finds output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         snapshot = {}
         for path in self.output_dir.rglob("*"):
             if path.is_file():
